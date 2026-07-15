@@ -2,7 +2,10 @@
 
 #include "timeline-mapper.hpp"
 
+#include <Processing.NDI.Lib.h>
 #include <obs.h>
+
+#include <cstdint>
 
 #include <atomic>
 #include <memory>
