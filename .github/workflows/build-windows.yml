@@ -1,99 +1,71 @@
-name: Build NDI Multichannel Bridge for Windows
+name: Build DistroAV Multichannel Hotfix
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, master]
-    paths-ignore:
-      - "**/*.md"
 
 permissions:
   contents: read
 
 jobs:
   build-windows:
+    name: Windows x64
     runs-on: windows-2022
 
     steps:
-      - name: Check out plugin
+      - name: Check out hotfix repository
         uses: actions/checkout@v4
+        with:
+          path: hotfix
 
-      - name: Download official OBS plugin build infrastructure
+      - name: Check out DistroAV 6.2.1
+        uses: actions/checkout@v4
+        with:
+          repository: DistroAV/DistroAV
+          ref: 6.2.1
+          submodules: recursive
+          fetch-depth: 0
+          path: distroav
+
+      - name: Apply multichannel patch
         shell: pwsh
+        run: |
+          python hotfix/scripts/patch_distroav.py distroav
+
+      - name: Build patched DistroAV
+        shell: pwsh
+        working-directory: distroav
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest -Uri 'https://github.com/obsproject/obs-plugintemplate/archive/refs/heads/master.zip' -OutFile "$env:RUNNER_TEMP\obs-plugintemplate.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\obs-plugintemplate.zip" -DestinationPath "$env:RUNNER_TEMP\obs-plugintemplate"
-          $template = Join-Path $env:RUNNER_TEMP 'obs-plugintemplate\obs-plugintemplate-master'
-          Copy-Item -Recurse -Force "$template\build-aux" "$env:GITHUB_WORKSPACE\build-aux"
-          Copy-Item -Recurse -Force "$template\cmake" "$env:GITHUB_WORKSPACE\cmake"
-          Copy-Item -Force "$template\CMakePresets.json" "$env:GITHUB_WORKSPACE\CMakePresets.json"
-          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\.github\scripts" | Out-Null
-          Copy-Item -Recurse -Force "$template\.github\scripts\*" "$env:GITHUB_WORKSPACE\.github\scripts"
+          & .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
 
-      - name: Retrieve NDI SDK headers from DistroAV 6.2.1 source
+      - name: Package patched DistroAV
         shell: pwsh
+        working-directory: distroav
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest -Uri 'https://github.com/DistroAV/DistroAV/archive/refs/tags/6.2.1.zip' -OutFile "$env:RUNNER_TEMP\DistroAV.zip"
-          Expand-Archive -Path "$env:RUNNER_TEMP\DistroAV.zip" -DestinationPath "$env:RUNNER_TEMP\DistroAV"
-          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\lib" | Out-Null
-          Copy-Item -Recurse -Force "$env:RUNNER_TEMP\DistroAV\DistroAV-6.2.1\lib\ndi" "$env:GITHUB_WORKSPACE\lib\ndi"
+          & .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
 
-      - name: Build Windows x64 DLL
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
-
-      - name: Create portable OBS package
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $packageRoot = Join-Path $env:GITHUB_WORKSPACE 'obs-install'
-          $distRoot = Join-Path $env:GITHUB_WORKSPACE 'dist'
-          Remove-Item -Recurse -Force $packageRoot -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force $distRoot -ErrorAction SilentlyContinue
-          $pluginDir = Join-Path $packageRoot 'obs-plugins\64bit'
-          $localeDir = Join-Path $packageRoot 'data\obs-plugins\ndi-multichannel-bridge\locale'
-          New-Item -ItemType Directory -Force $pluginDir | Out-Null
-          New-Item -ItemType Directory -Force $localeDir | Out-Null
-          New-Item -ItemType Directory -Force $distRoot | Out-Null
-
-          $dll = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Recurse -File -Filter 'ndi-multichannel-bridge.dll' |
-            Where-Object { $_.FullName -notlike '*\.deps\*' -and $_.FullName -notlike '*\obs-install\*' -and $_.FullName -notlike '*\dist\*' } |
-            Sort-Object @{ Expression = { if ($_.FullName -match 'RelWithDebInfo|Release') { 0 } else { 1 } } }, FullName |
-            Select-Object -First 1
-          if ($null -eq $dll) { throw 'Could not locate ndi-multichannel-bridge.dll.' }
-
-          Copy-Item -Force $dll.FullName (Join-Path $pluginDir 'ndi-multichannel-bridge.dll')
-          Copy-Item -Force "$env:GITHUB_WORKSPACE\data\locale\en-US.ini" (Join-Path $localeDir 'en-US.ini')
-          Copy-Item -Force "$env:GITHUB_WORKSPACE\README.md" (Join-Path $packageRoot 'README.md')
-          Copy-Item -Force "$env:GITHUB_WORKSPACE\LICENSE" (Join-Path $packageRoot 'LICENSE')
-          Compress-Archive -Path (Join-Path $packageRoot '*') -DestinationPath (Join-Path $distRoot 'NDI-Multichannel-Bridge-Portable.zip') -Force
-
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup --no-progress -y
-
-      - name: Build installer
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DMyAppVersion=0.1.0" "/DSourceRoot=$env:GITHUB_WORKSPACE\obs-install" "/DOutputRoot=$env:GITHUB_WORKSPACE\dist" "$env:GITHUB_WORKSPACE\installer\NDIMultichannelBridge.iss"
-
-      - name: Generate checksums
-        shell: pwsh
-        run: |
-          Get-ChildItem "$env:GITHUB_WORKSPACE\dist" -File | ForEach-Object {
-            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$hash *$($_.Name)"
-          } | Set-Content -Encoding ascii "$env:GITHUB_WORKSPACE\dist\SHA256SUMS.txt"
-
-      - name: Upload install-ready plugin
+      - name: Upload normal Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: ndi-multichannel-bridge-0.1.0-alpha-windows-x64
-          path: dist/
-          if-no-files-found: error
-          retention-days: 30
+          name: DistroAV-6.2.1-multichannel-hotfix-windows-x64
+          path: |
+            distroav/release/*.zip
+            distroav/release/*.exe
+          if-no-files-found: warn
+
+      - name: Upload portable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: DistroAV-6.2.1-multichannel-hotfix-windows-x64-portable
+          path: distroav/release-portable/*.zip
+          if-no-files-found: warn
+
+      - name: Upload patched source tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: DistroAV-6.2.1-multichannel-hotfix-source
+          path: |
+            distroav/src/ndi-output.cpp
+            distroav/src/main-output.cpp
+            distroav/MULTICHANNEL-HOTFIX.md
