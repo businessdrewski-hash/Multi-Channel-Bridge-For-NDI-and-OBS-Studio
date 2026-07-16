@@ -73,11 +73,18 @@ jobs:
             Copy-Item -Path "$built\data\locale" -Destination "$package\data\obs-plugins\distroav\locale" -Recurse -Force
           }
 
+          # Required release documentation
           Copy-Item README.md $package
           Copy-Item INSTALL-BOTH-PCS.md $package
           Copy-Item RELEASE-NOTES.md $package
-          Copy-Item ROADMAP.md $package
           Copy-Item LICENSE-NOTICE.txt $package
+
+          # Optional documentation: do not fail the entire Windows build if omitted
+          if (Test-Path ROADMAP.md) {
+            Copy-Item ROADMAP.md $package
+          } else {
+            Write-Warning 'ROADMAP.md was not found; continuing without it.'
+          }
           Copy-Item distroav/LICENSE "$package\DISTROAV-GPL-LICENSE.txt"
           Copy-Item tools/Install-MultichannelBridge.ps1 $package
           Copy-Item tools/Install-MultichannelBridge.cmd $package
