@@ -1,38 +1,29 @@
 # Multichannel Bridge for DistroAV
 
-> **Experimental alpha software for two-PC OBS workflows**  
-> Current build/UI name: **NDI Multichannel Bridge 0.3.0-alpha**  
-> Base: **DistroAV 6.2.1**
+> Experimental modified DistroAV build for two-PC OBS setups  
+> Current version: **0.3.0-alpha**  
+> Based on: **DistroAV 6.2.1**
 
-Multichannel Bridge for DistroAV is a custom, GPL-licensed modification of [DistroAV](https://github.com/DistroAV/DistroAV) that sends one OBS video output together with multiple independently mixable stereo audio buses through a single NDI® sender. The receiving PC separates those audio channel pairs back into ordinary OBS mixer sources before OBS can downmix them.
+Multichannel Bridge for DistroAV sends one OBS video output together with two independent stereo audio mixes through a single NDI® sender. On the receiving PC, those four audio channels are split back into separate OBS mixer sources before OBS downmixes them.
 
-The current alpha carries two stereo buses—normally game/desktop audio and microphone—as four NDI audio channels beside the standard DistroAV Main Output video stream. The design is intended to reduce a class of two-PC A/V synchronization failures caused by running video/program audio and microphone audio through separate NDI senders, connections, receive buffers, and timing paths.
+The current build is intended for a common two-PC layout:
 
-> **Important:** This is an independent experimental modification. It is **not** an official OBS Project, DistroAV, or Vizrt NDI AB release, and none of those organizations endorse or support it.
+- **OBS Track 5 → NDI channels 1–2:** game, desktop, Discord, alerts, or program audio
+- **OBS Track 6 → NDI channels 3–4:** microphone
+
+The stream PC receives one DistroAV NDI source for video, plus separate **MCB Desktop / Game** and **MCB Microphone** sources for independent mixing and recording.
+
+> This is an independent, unofficial modification. It is not affiliated with or endorsed by the OBS Project, DistroAV project, or Vizrt NDI AB.
 
 ---
 
 ## Why this exists
 
-Some long-running two-PC OBS/NDI workflows experience one or both of these symptoms:
+Some long-running two-PC NDI workflows can develop gradual A/V drift or sudden sync jumps after a reconnect, game-capture rehook, buffer correction, or sender reset. Earlier troubleshooting included restarting NDI outputs, resetting sources, testing Frame Sync, monitoring timestamps and buffers, and experimenting with small audio-rate corrections in parts per million.
 
-- **Gradual drift:** audio slowly moves ahead of or behind video over a long recording or stream.
-- **Sudden sync jumps:** audio abruptly skips, cuts, or changes offset after a source interruption, capture-hook reattachment, buffer correction, NDI reconnect, or sender/receiver reset.
+Those techniques can help diagnose or recover from a problem, but they do not remove the underlying complexity of running video/program audio and microphone audio through separate senders and receive paths.
 
-Community reports of long-duration DistroAV/OBS-NDI audio delay exist—for example, [DistroAV issue #742](https://github.com/DistroAV/DistroAV/issues/742)—but this project does **not** claim that every DistroAV installation drifts or that every synchronization problem has the same cause.
-
-Before this bridge was built, the troubleshooting path included:
-
-- restarting or force-resetting NDI outputs after an apparent discontinuity;
-- resetting sender and receiver sources to clear stale buffering state;
-- testing NDI Frame Sync on and off;
-- monitoring buffer age, timestamps, dropped frames, reconnects, and queue behavior;
-- experimenting with small audio-rate corrections in parts per million (PPM) to counter slow clock-rate mismatch;
-- running separate NDI audio-only senders for desktop/game and microphone audio.
-
-Those methods can be useful diagnostically, but they primarily treat symptoms after timing has diverged. They also add more state, more correction logic, or more independent network paths.
-
-The simpler approach used here is structural: **send video, game/program audio, and microphone audio through one DistroAV Main Output sender and one receive connection, while keeping the audio buses separately controllable on the stream PC.**
+This project takes a simpler approach: **video, game audio, and microphone audio all travel through the same DistroAV Main Output sender, connection, and timestamp timeline while remaining separately controllable on the stream PC.**
 
 ---
 
@@ -40,218 +31,143 @@ The simpler approach used here is structural: **send video, game/program audio, 
 
 ```mermaid
 flowchart LR
-    subgraph G[Gaming PC / Sender]
-        V[OBS Video / Program Scene]
-        A[OBS Track 5\nProgram / Game Stereo]
-        B[OBS Track 6\nMicrophone Stereo]
-        M[Multichannel Bridge\nPair blocks + preserve timing\nBuild 4-channel audio]
-        D[Patched DistroAV Main Output\nNormal DistroAV video path]
+    subgraph G[Gaming PC]
+        V[OBS video]
+        A[OBS Track 5\nGame / Program stereo]
+        B[OBS Track 6\nMicrophone stereo]
+        M[Multichannel Bridge\nBuilds 4-channel audio]
+        D[Patched DistroAV Main Output]
         A --> M
         B --> M
         V --> D
         M --> D
     end
 
-    D -->|One NDI sender\nVideo + 4-channel audio| N[Single NDI connection\nShared sender identity and timeline]
+    D -->|One NDI sender\nVideo + 4-channel audio| N[Single NDI connection]
 
-    subgraph S[Stream PC / Receiver]
+    subgraph S[Stream PC]
         R[DistroAV NDI Source]
-        X[Receiver Bridge\nIntercept before OBS downmix]
-        VO[Video remains on original NDI source]
+        X[Receiver bridge\nSplits audio before downmix]
         P[MCB Desktop / Game\nChannels 1-2]
         MIC[MCB Microphone\nChannels 3-4]
-        MIX[Independent OBS mixer control\nand separate recording tracks]
         R --> X
-        X --> VO
         X --> P
         X --> MIC
-        P --> MIX
-        MIC --> MIX
     end
 
     N --> R
 ```
 
-### Sender side
+### Sender
 
-The Gaming PC uses the regular DistroAV Main Output video path. The bridge captures two selected OBS stereo mixes, normally:
+The bridge captures two OBS stereo tracks, pairs their audio blocks, and creates one four-channel audio frame:
 
-| OBS mix | NDI channel mapping | Typical use |
-|---|---:|---|
-| Track 5 | Channels 1–2 | Game, desktop, Discord, alerts, program mix |
-| Track 6 | Channels 3–4 | Microphone |
+```text
+Channels 1–2 = Track 5
+Channels 3–4 = Track 6
+```
 
-The bridge:
+DistroAV continues to use its normal Main Output video path. The bridge only changes how multiple OBS audio tracks are packed into the existing sender.
 
-1. receives raw stereo blocks from both selected OBS mixes;
-2. holds them briefly in bounded FIFO queues;
-3. accepts OBS’s normal one-block callback phase at 48 kHz;
-4. pairs compatible blocks and constructs one four-channel planar float audio frame;
-5. passes that frame into DistroAV’s existing NDI sender beside the normal video frames;
-6. substitutes silence only when one selected mix genuinely stops producing callbacks long enough to require fallback.
+### Receiver
 
-At 48 kHz, a normal 1,024-sample audio block represents approximately **21.333 ms**. A stable sender commonly reports that value as the last timestamp delta.
+The receiving DistroAV source sees the incoming four-channel audio before OBS converts it to the profile’s normal speaker layout. The bridge splits it into two standard OBS audio sources and suppresses the original combined audio to prevent duplication.
 
-### Receiver side
-
-The Stream PC adds one ordinary DistroAV NDI Source for the combined feed. The receiver bridge intercepts the incoming raw four-channel audio inside DistroAV **before OBS remixes it to the profile’s stereo speaker layout**.
-
-It then creates two standard OBS audio-only sources:
-
-- **MCB Desktop / Game** — channels 1–2
-- **MCB Microphone** — channels 3–4
-
-The original DistroAV source continues to provide video. Once both split audio outputs are ready, the bridge can suppress the original combined audio packet to prevent duplicated or downmixed audio.
-
-### What “tied to the video” means
-
-Audio is not physically embedded inside each video frame. NDI still transports audio frames and video frames as distinct frame types. In this design, however, they share:
-
-- one DistroAV sender object;
-- one advertised NDI source;
-- one sender/receiver connection;
-- one associated sender timeline;
-- one network and receive-buffering path.
-
-This removes the independent sender and connection state that exists when microphone audio is transmitted as a separate NDI audio-only source.
+Audio and video are still separate NDI frame types, but they now share one sender identity, one connection, and one timing path instead of separate NDI senders.
 
 ---
 
 ## Current capabilities
 
-- One normal DistroAV Main Output video stream—no second video encode or duplicate 4K frame-copy path.
-- Two configurable OBS stereo tracks packed into one four-channel NDI audio stream.
-- Independent game/program and microphone faders on the receiving OBS instance.
-- Independent stream and recording-track routing after reception.
-- Bounded sender queues to prevent unbounded latency growth.
-- Silence fallback if one selected OBS mix stops delivering callbacks.
-- Receiver-side channel splitting before OBS downmix.
-- Automatic suppression of the original combined audio after split outputs are active.
-- Sender and receiver status dock with counters, meters, queue depth, packet age, detected channel count, missing-channel counters, and diagnostics copy/reset controls.
-- Role protection so the same package can be installed on both computers while the receiver role disables accidental Main Output loopback.
+- One normal DistroAV Main Output video stream
+- Two configurable OBS stereo tracks carried as four NDI audio channels
+- Separate game/program and microphone sources on the stream PC
+- Independent stream and recording-track routing
+- Bounded audio queues
+- Silence fallback if one selected OBS track stops delivering callbacks
+- Duplicate-audio suppression on the receiver
+- Sender and receiver diagnostics
+- One package for both PCs, with selectable Sender and Receiver roles
 
-### Theoretical expansion
+### Possible future expansion
 
-OBS exposes up to six audio mixes. The same architecture could theoretically map all six stereo mixes into twelve NDI audio channels:
-
-```text
-OBS Track 1 -> NDI channels 1-2
-OBS Track 2 -> NDI channels 3-4
-OBS Track 3 -> NDI channels 5-6
-OBS Track 4 -> NDI channels 7-8
-OBS Track 5 -> NDI channels 9-10
-OBS Track 6 -> NDI channels 11-12
-```
-
-That expansion is **not implemented in v0.3.0-alpha**. It would require dynamic multi-track selection, additional pairing queues, per-bus fallback handling, and receiver proxy generation for each enabled stereo pair.
-
----
-
-## Audio format and bandwidth
-
-The current bridge sends four channels of 48 kHz, 32-bit floating-point audio:
-
-```text
-48,000 samples/sec × 4 channels × 32 bits = 6.144 Mbit/sec
-```
-
-Approximate payload rates before transport overhead:
-
-- Four channels total: **6.144 Mbit/s**
-- Each stereo pair: **3.072 Mbit/s**
-- Each mono channel: **1.536 Mbit/s**
-
-The audio payload is small compared with a high-bandwidth 4K NDI video stream.
+OBS exposes six audio tracks, so the same design could theoretically support up to six stereo pairs, or twelve NDI audio channels. That is not implemented in the current alpha.
 
 ---
 
 ## Requirements
 
-Current alpha target:
-
 - Windows x64
-- OBS Studio compatible with DistroAV 6.2.1
-- DistroAV 6.2.1 codebase, modified by this project
+- OBS Studio
 - NDI 6 Runtime installed separately
-- 48 kHz OBS audio sample rate on both PCs
-- A stable wired network appropriate for the selected NDI video format and resolution
+- 48 kHz audio on both PCs
+- A wired network suitable for the selected NDI resolution and frame rate
 
-Known test environment during development:
+Known development environment:
 
 - OBS Studio 32.1.2
 - DistroAV 6.2.1 base
 - NDI Runtime 6.3.2
-- Windows 11 x64
 
-This is a test record, not a guarantee of compatibility with every system.
+Compatibility outside that environment is not guaranteed.
 
 ---
 
 ## Installation
 
-> Future Windows releases should use the provided signed or clearly identified `.exe` installer. Manual copying is retained here only as a fallback for development builds.
+Install the same build on both computers. Future releases should use the included Windows `.exe` installer.
 
-Install the **same compiled package on both PCs**.
+Before installing:
 
-Before installation:
-
-1. Close OBS completely.
+1. Close OBS.
 2. Back up your OBS profile and scene collection.
-3. Remove or disable obsolete standalone `ndi-multichannel-bridge.dll` builds from v0.2.x.
+3. Remove obsolete standalone `ndi-multichannel-bridge.dll` builds.
 4. Make sure only one active `distroav.dll` exists across OBS plugin locations.
-5. Install the NDI Runtime separately from the official NDI distribution if it is not already present.
 
 ### Gaming PC
 
-1. Install the custom DistroAV build.
-2. Open **Docks → NDI Multichannel Bridge**.
-3. Select **Gaming PC / Sender**.
-4. Select the two OBS audio tracks—defaults are Track 5 and Track 6.
-5. Route program/game audio to Track 5 and microphone audio to Track 6 in **Advanced Audio Properties**.
-6. Remove old DistroAV audio-only output filters that would create separate desktop or microphone NDI senders.
-7. Enable **DistroAV Main Output** and choose a unique source name.
+1. Open **Docks → NDI Multichannel Bridge**.
+2. Select **Gaming PC / Sender**.
+3. Choose the two OBS tracks, normally Track 5 and Track 6.
+4. Route game/program audio to Track 5 and microphone audio to Track 6 in **Advanced Audio Properties**.
+5. Remove old separate NDI audio-only filters or sources.
+6. Enable **DistroAV Main Output**.
 
 ### Stream PC
 
-1. Install the same custom DistroAV build.
-2. Open **Docks → NDI Multichannel Bridge**.
-3. Select **Stream PC / Receiver**.
-4. Add one ordinary **DistroAV NDI Source** and select the Gaming PC’s combined feed.
-5. In the bridge dock, attach to that OBS source.
-6. Run **Create / repair split audio sources**.
-7. Confirm that **MCB Desktop / Game** and **MCB Microphone** appear as separate mixer sources.
-8. Enable suppression of the original combined audio to avoid duplication.
-9. Route the two split sources to stream and recording tracks as desired.
+1. Open **Docks → NDI Multichannel Bridge**.
+2. Select **Stream PC / Receiver**.
+3. Add one ordinary DistroAV NDI Source and select the Gaming PC feed.
+4. Attach the bridge to that source.
+5. Create or repair the split audio sources.
+6. Confirm that **MCB Desktop / Game** and **MCB Microphone** appear separately in the mixer.
+7. Keep original-audio suppression enabled to avoid duplicate audio.
 
 ---
 
-## Frame Sync guidance
+## Frame Sync
 
-For a single combined sender being recorded or streamed by one receiving OBS instance, begin testing with **NDI Frame Sync disabled** on the receiver source.
+For a single combined sender being received by one OBS instance, begin testing with **NDI Frame Sync disabled**.
 
-Frame Sync can be useful when adapting multiple independent sources to a common local clock, but it may also retime audio and video. In systems where periodic 100–300 ms audio skips or jumps are heard, compare a clean test with Frame Sync disabled before changing anything else.
+Frame Sync can help when adapting multiple independent sources to a common local clock, but it may also retime or buffer audio and video. If periodic audio skips or sudden 100–300 ms jumps occur, compare a clean test with Frame Sync disabled before changing anything else.
 
-Disabling Frame Sync does not separate the four-channel audio from the sender. The audio and video still arrive from the same NDI source and retain their incoming timing relationship. A slow drift that appears only with Frame Sync disabled would indicate an additional clock, timestamp, buffering, reconnect, or implementation problem that should be measured rather than hidden with repeated resets.
-
-Official background: [NDI frame synchronization documentation](https://docs.ndi.video/all/developing-with-ndi/advanced-sdk/ndi-sdk-review/video-formats/frame-synchronization).
+Official background: [NDI frame synchronization documentation](https://docs.ndi.video/all/developing-with-ndi/advanced-sdk/ndi-sdk-review/video-formats/frame-synchronization)
 
 ---
 
 ## Healthy diagnostics
 
-### Gaming PC / Sender
+### Gaming PC
 
 A healthy sender normally shows:
 
 - `Sender active: yes`
 - `Paired` continuously increasing
-- `Discarded: 0` or nearly zero
+- `Discarded: 0`
 - `Silence fallback: 0`
-- `Last timestamp delta: 21.333 ms` at 48 kHz/1,024 samples
 - queue depths returning to `0 / 0`
-- low sender audio age
 
-### Stream PC / Receiver
+### Stream PC
 
 A healthy receiver normally shows:
 
@@ -259,185 +175,108 @@ A healthy receiver normally shows:
 - `Split outputs ready: yes`
 - `Split outputs active: yes`
 - `Detected channels: 4`
-- `Packets` continuously increasing
-- suppressed-packet count increasing at approximately the same rate as packets
 - `Missing program: 0`
 - `Missing mic: 0`
-- low receiver packet age
-
-Receiver values are expected to remain inactive on the Gaming PC, and sender values are expected to remain inactive on the Stream PC.
+- packet count continuously increasing
 
 ---
 
-## Troubleshooting A/V sync problems
+## Troubleshooting
 
-### Periodic audio skip or sudden jump
+### Audio skips or jumps
 
-1. Disable Frame Sync on the combined receiver source.
-2. Restart OBS on the receiver to clear the old Frame Sync state.
-3. Verify that `Missing program`, `Missing mic`, `Discarded`, and `Silence fallback` remain zero.
-4. Check the OBS log for an NDI source reconnect, audio buffering increase, capture-hook reattachment, or output restart at the same time as the jump.
-5. Confirm there are no old separate NDI microphone or desktop-audio sources still active.
+- Disable Frame Sync and restart the receiving OBS instance.
+- Confirm there are no old separate NDI microphone or desktop-audio sources still active.
+- Check whether `Discarded`, `Silence fallback`, `Missing program`, or `Missing mic` increased.
+- Check both OBS logs for reconnects, buffer changes, capture-hook reattachment, or output restarts.
 
-### Slow drift over time
+### Slow drift
 
-1. Measure the direction and rate of drift over at least 30–60 minutes.
-2. Confirm both OBS instances are set to 48 kHz.
-3. Confirm the bridge is preserving incoming timestamps and no fallback/discard counters are increasing.
-4. Compare Frame Sync on versus off in separate controlled tests.
-5. Record OBS logs from both PCs for the same test window.
-6. Avoid applying PPM correction until the drift rate is repeatable and the underlying path is known; PPM adjustment can compensate clock mismatch but cannot repair sudden timestamp discontinuities.
+- Confirm both PCs use 48 kHz audio.
+- Measure the direction and rate over at least 30–60 minutes.
+- Compare controlled tests with Frame Sync on and off.
+- Avoid applying PPM correction until the drift is repeatable and the affected timing path is known.
 
-### Large offset after game capture rehooks
+### Duplicate DistroAV menus
 
-A game-capture hook can disappear and return while the OBS audio engine continues uninterrupted. Because audio and video are still separate frame types, a capture discontinuity can still create a step change if OBS, DistroAV, NDI, or the receiving buffer does not re-establish the same timing relationship.
-
-Capture logs from both PCs and look for:
-
-- game-capture hook loss/reacquisition;
-- video-frame interruption while audio packets continue;
-- NDI sender or receiver restart;
-- source reconnect;
-- abrupt buffer growth or reset.
-
-A forced reset may clear the symptom, but it should be treated as recovery—not as proof that the root cause is fixed.
-
-## What this project does not guarantee
-
-This project reduces independent sender and receive paths; it does not make audio and video inseparable or eliminate every cause of synchronization failure.
-
-It cannot guarantee protection from:
-
-- network packet loss, congestion, or interface resets;
-- NDI sender/receiver reconnects;
-- OBS source or audio-engine restarts;
-- game-capture hook loss and reacquisition;
-- Frame Sync corrections;
-- driver clock discontinuities;
-- timestamp bugs in OBS, DistroAV, NDI, or this patch;
-- recording muxer or playback-software timing problems.
-
-Treat this as an experimental diagnostic and workflow improvement, not as a certified broadcast synchronization appliance.
-
----
-
-## Building from source
-
-The release source must contain the exact modified DistroAV source used to produce the binary, or otherwise satisfy the complete-source obligations of the GNU GPL.
-
-Recommended release layout:
+Only one active DistroAV installation should remain. Common plugin locations include:
 
 ```text
-README.md
-LICENSE
-CHANGE-NOTICE.md
-THIRD-PARTY-NOTICES.md
-LEGAL-COMPLIANCE-CHECKLIST.md
-src/                         # complete patched DistroAV source tree
-.github/workflows/           # build scripts
-installer/                   # installer source and configuration
-release/                     # binary packages and checksums
+C:\Program Files\obs-studio\obs-plugins\64bit\distroav.dll
+C:\ProgramData\obs-studio\plugins\distroav\bin\64bit\distroav.dll
+%APPDATA%\obs-studio\plugins\distroav\bin\64bit\distroav.dll
 ```
 
-The current patch targets [DistroAV 6.2.1](https://github.com/DistroAV/DistroAV/releases/tag/6.2.1). A reproducible build should identify the exact upstream tag/commit, include all bridge source files and patch scripts, and produce checksums for released binaries.
+### Missing old multichannel plugin warning
+
+Version 0.3 is integrated into `distroav.dll`. It does not use the old standalone `ndi-multichannel-bridge.dll`. Remove the obsolete module entry from OBS Plugin Manager if OBS still reports it as missing.
 
 ---
 
-## Credits and upstream projects
+## Credits
 
-This project would not exist without the work of the OBS and DistroAV communities.
+This project is built on the work of the OBS and DistroAV communities.
 
 ### OBS Studio
 
-[OBS Studio](https://obsproject.com/) is free and open-source software for capturing, compositing, recording, encoding, and live streaming.
+[OBS Studio](https://obsproject.com/) provides the host application, audio mixer, plugin APIs, source/output framework, and recording/streaming platform used by this project.
 
-- Official website: [obsproject.com](https://obsproject.com/)
-- Source code: [github.com/obsproject/obs-studio](https://github.com/obsproject/obs-studio)
-- Developer/API documentation: [obsproject.com/docs](https://obsproject.com/docs/)
-- User documentation and help: [obsproject.com/help](https://obsproject.com/help)
+- Website: [obsproject.com](https://obsproject.com/)
+- Source: [github.com/obsproject/obs-studio](https://github.com/obsproject/obs-studio)
+- Developer documentation: [obsproject.com/docs](https://obsproject.com/docs/)
 - License: [GNU GPL version 2 or later](https://github.com/obsproject/obs-studio/blob/master/COPYING)
-- Support the OBS Project: [obsproject.com/contribute](https://obsproject.com/contribute)
-
-Credit belongs to the OBS Project maintainers and contributors for the host application, audio mixer architecture, plugin APIs, frontend APIs, source/output framework, and the broader OBS ecosystem used by this modification.
+- Support the project: [obsproject.com/contribute](https://obsproject.com/contribute)
 
 ### DistroAV
 
-[DistroAV](https://github.com/DistroAV/DistroAV), formerly OBS-NDI, provides the NDI integration for OBS that this project modifies.
+[DistroAV](https://github.com/DistroAV/DistroAV), formerly OBS-NDI, provides the original NDI source, output, filters, runtime loading, configuration, and build systems modified by this project.
 
-- Official source repository: [github.com/DistroAV/DistroAV](https://github.com/DistroAV/DistroAV)
-- Base release used here: [DistroAV 6.2.1](https://github.com/DistroAV/DistroAV/releases/tag/6.2.1)
-- Issue tracker: [github.com/DistroAV/DistroAV/issues](https://github.com/DistroAV/DistroAV/issues)
+- Source: [github.com/DistroAV/DistroAV](https://github.com/DistroAV/DistroAV)
+- Base release: [DistroAV 6.2.1](https://github.com/DistroAV/DistroAV/releases/tag/6.2.1)
+- Issues: [github.com/DistroAV/DistroAV/issues](https://github.com/DistroAV/DistroAV/issues)
 - License: [GNU GPL version 2 or later](https://github.com/DistroAV/DistroAV/blob/master/LICENSE)
-- Project support: [Open Collective](https://opencollective.com/distroav)
-
-Credit belongs to the DistroAV maintainers and contributors for the original NDI source, output, filter, runtime-loading, configuration, platform integration, and build systems. This bridge is a modified derivative of DistroAV—not a clean-room replacement.
+- Support the project: [Open Collective](https://opencollective.com/distroav)
 
 ### NDI technology
 
-NDI is an IP video and audio connectivity technology from Vizrt NDI AB.
+NDI is a video and audio connectivity technology from Vizrt NDI AB.
 
-- Official website: [ndi.video](https://ndi.video/)
-- NDI Tools and Runtime: [ndi.video/tools](https://ndi.video/tools/)
+- Website: [ndi.video](https://ndi.video/)
+- Tools and Runtime: [ndi.video/tools](https://ndi.video/tools/)
 - Documentation: [docs.ndi.video](https://docs.ndi.video/)
-- SDK licensing and trademark guidance: [NDI licensing documentation](https://docs.ndi.video/all/developing-with-ndi/sdk/licensing)
+- Licensing and trademark guidance: [NDI licensing documentation](https://docs.ndi.video/all/developing-with-ndi/sdk/licensing)
 
-This project does not claim ownership of NDI technology, the NDI SDK, runtime, trademarks, or logos.
-
----
-
-## License
-
-This modified DistroAV build and the bridge additions are distributed under the **GNU General Public License, version 2 or, at your option, any later version** (`GPL-2.0-or-later`) to remain compatible with the upstream DistroAV codebase.
-
-See [`LICENSE`](LICENSE) for the complete license text.
-
-- **NDI® is a registered trademark of Vizrt NDI AB.**
-- OBS, OBS Studio, Open Broadcaster Software, and the OBS Studio logo are trademarks or registered trademarks of their respective owner, including Wizards of OBS LLC as identified by the OBS Project.
-- DistroAV and associated project names, logos, and marks belong to their respective owners.
-- All other product names and trademarks are the property of their respective owners.
+NDI® is a registered trademark of Vizrt NDI AB.
 
 ---
 
-## No affiliation or endorsement
+## License and redistribution
 
-This project is independently developed and is not affiliated with, sponsored by, certified by, or endorsed by:
+This modified DistroAV build and the bridge additions are distributed under the **GNU General Public License, version 2 or, at your option, any later version** (`GPL-2.0-or-later`). See [`LICENSE`](LICENSE).
 
-- the OBS Project;
-- Wizards of OBS LLC;
-- the DistroAV project or its maintainers;
-- Vizrt NDI AB;
-- NewTek, Vizrt, or any related entity.
+If you distribute a binary build, you should also:
 
-Do not direct support requests for this modification to upstream OBS, DistroAV, or NDI maintainers unless the issue has first been reproduced on an unmodified official build and is appropriate for that upstream project.
+- preserve OBS and DistroAV copyright and license notices;
+- clearly identify that the build is modified;
+- provide the complete corresponding source code and build/install scripts for that exact binary as required by the GPL;
+- keep the derivative work under GPL-compatible terms;
+- comply separately with any licenses covering bundled third-party components;
+- avoid bundling the NDI Runtime or SDK unless you have confirmed that distribution is permitted under the applicable NDI terms.
 
----
+This project is not affiliated with or endorsed by the OBS Project, DistroAV project, or Vizrt NDI AB. Do not send support requests for this modified build to upstream maintainers unless the problem has first been reproduced on an official unmodified release.
 
-## Warranty and limitation of liability
-
-This software is provided **as is**, without warranty of any kind. To the maximum extent permitted by applicable law, the authors, contributors, OBS Project, DistroAV contributors, Vizrt NDI AB, and other upstream parties are not liable for data loss, lost recordings, lost revenue, missed broadcasts, synchronization errors, network disruption, hardware damage, or other direct or indirect damages arising from use of this experimental modification.
-
-The full controlling warranty disclaimer is contained in the GNU GPL included with the project.
+This software is provided **as is**, without warranty of any kind. Use it first in non-critical recordings and verify long-duration behavior before relying on it for a live production.
 
 ---
-
-## Security and network notice
-
-This bridge does not add encryption, authentication, or access control to NDI transport. Do not assume that media carried on an NDI network is confidential. Use trusted networks, appropriate segmentation, firewall rules, and official NDI security/access-management guidance for the deployment environment.
 
 ## Project status
 
-**v0.3.0-alpha is experimental.** It has been built and tested in a specific two-PC environment, but it has not undergone broad hardware, network, regression, security, or broadcast-certification testing.
+**0.3.0-alpha is experimental.** It has been tested in a specific two-PC environment but has not undergone broad hardware, network, regression, security, or broadcast-certification testing.
 
-Use it first in non-critical recordings, retain backups of OBS configuration, and verify long-duration behavior before relying on it for a live production.
-
----
-
-## Copyright
-
-Bridge additions and project documentation:
+Bridge additions and documentation:
 
 ```text
-Copyright (C) 2026 Andrew Carriker
+Copyright (C) 2026 Andrew Carriker and contributors
 ```
 
-Upstream OBS Studio and DistroAV portions remain copyright their respective authors and contributors. See the upstream repositories, source-file notices, [`CHANGE-NOTICE.md`](CHANGE-NOTICE.md), and [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+OBS Studio and DistroAV portions remain copyright their respective authors and contributors.
