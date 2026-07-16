@@ -1,7 +1,0 @@
-1. Create a new GitHub repository.
-2. Upload every file and folder from this archive, including .github.
-3. Open Actions > Build NDI Multichannel Bridge for Windows.
-4. Click Run workflow.
-5. Download the artifact after the build finishes.
-
-The workflow retrieves the official OBS plugin build infrastructure and the NDI SDK headers contained in the DistroAV 6.2.1 source tree. It does not package the NDI runtime DLL.
