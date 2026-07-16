@@ -1,4 +1,4 @@
-name: Build DistroAV Multichannel Hotfix
+name: Build Unified NDI Multichannel Bridge
 
 on:
   workflow_dispatch:
@@ -8,64 +8,47 @@ permissions:
 
 jobs:
   build-windows:
-    name: Windows x64
     runs-on: windows-2022
-
     steps:
-      - name: Check out hotfix repository
+      - name: Check out bridge
         uses: actions/checkout@v4
-        with:
-          path: hotfix
 
-      - name: Check out DistroAV 6.2.1
-        uses: actions/checkout@v4
-        with:
-          repository: DistroAV/DistroAV
-          ref: 6.2.1
-          submodules: recursive
-          fetch-depth: 0
-          path: distroav
-
-      - name: Apply multichannel patch
+      - name: Fetch OBS plugin build infrastructure
         shell: pwsh
         run: |
-          python hotfix/scripts/patch_distroav.py distroav
+          git clone --depth 1 https://github.com/obsproject/obs-plugintemplate.git _template
+          Copy-Item -Recurse -Force _template/cmake ./cmake
+          Copy-Item -Recurse -Force _template/.github/scripts ./.github/scripts
 
-      - name: Build patched DistroAV
+      - name: Fetch NDI SDK headers from DistroAV 6.2.1
         shell: pwsh
-        working-directory: distroav
         run: |
-          $ErrorActionPreference = 'Stop'
+          git clone --depth 1 --branch 6.2.1 https://github.com/DistroAV/DistroAV.git _distroav
+          New-Item -ItemType Directory -Force lib/ndi | Out-Null
+          Copy-Item -Recurse -Force _distroav/lib/ndi/* lib/ndi/
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
           & .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
 
-      - name: Package patched DistroAV
+      - name: Create portable package
         shell: pwsh
-        working-directory: distroav
         run: |
           $ErrorActionPreference = 'Stop'
-          & .github/scripts/Package-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
+          $out = 'release/NDI-Multichannel-Bridge-0.2.0-windows-x64'
+          New-Item -ItemType Directory -Force "$out/obs-plugins/64bit" | Out-Null
+          New-Item -ItemType Directory -Force "$out/data/obs-plugins/ndi-multichannel-bridge/locale" | Out-Null
+          $dll = Get-ChildItem -Recurse -Filter 'ndi-multichannel-bridge.dll' | Where-Object { $_.FullName -match 'RelWithDebInfo|Release' } | Select-Object -First 1
+          if (-not $dll) { throw 'Built plugin DLL not found' }
+          Copy-Item $dll.FullName "$out/obs-plugins/64bit/ndi-multichannel-bridge.dll"
+          Copy-Item data/locale/* "$out/data/obs-plugins/ndi-multichannel-bridge/locale/"
+          Copy-Item README.md,INSTALL-AND-USE.md,LICENSE,THIRD_PARTY_NOTICES.md $out/
+          Compress-Archive -Path "$out/*" -DestinationPath 'release/NDI-Multichannel-Bridge-0.2.0-windows-x64.zip' -Force
 
-      - name: Upload normal Windows package
+      - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: DistroAV-6.2.1-multichannel-hotfix-windows-x64
-          path: |
-            distroav/release/*.zip
-            distroav/release/*.exe
-          if-no-files-found: warn
-
-      - name: Upload portable Windows package
-        uses: actions/upload-artifact@v4
-        with:
-          name: DistroAV-6.2.1-multichannel-hotfix-windows-x64-portable
-          path: distroav/release-portable/*.zip
-          if-no-files-found: warn
-
-      - name: Upload patched source tree
-        uses: actions/upload-artifact@v4
-        with:
-          name: DistroAV-6.2.1-multichannel-hotfix-source
-          path: |
-            distroav/src/ndi-output.cpp
-            distroav/src/main-output.cpp
-            distroav/MULTICHANNEL-HOTFIX.md
+          name: NDI-Multichannel-Bridge-0.2.0-windows-x64
+          path: release/NDI-Multichannel-Bridge-0.2.0-windows-x64.zip
+          if-no-files-found: error
