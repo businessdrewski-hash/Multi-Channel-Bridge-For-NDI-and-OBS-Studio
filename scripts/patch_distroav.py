@@ -13,7 +13,7 @@ import json
 import re
 from pathlib import Path
 
-PATCH_MARKER = "DistroAV Multichannel Main Output hotfix v0.1.0"
+PATCH_MARKER = "DistroAV Multichannel Main Output hotfix v0.1.1"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -49,7 +49,7 @@ def patch_ndi_output(path: Path) -> None:
     )
 
     state_types = r'''
-// DistroAV Multichannel Main Output hotfix v0.1.0
+// DistroAV Multichannel Main Output hotfix v0.1.1
 // OBS Track A is packed into NDI channels 1-2 and Track B into channels 3-4.
 struct multichannel_stereo_block {
 	bool valid = false;
@@ -295,34 +295,73 @@ void ndi_output_rawaudio2(void *data, size_t mix_idx, audio_data *frame)
 
 def patch_main_output(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    if 'obs_data_set_bool(output_settings, "multichannel_audio", true);' in text:
+    marker = 'obs_data_set_bool(output_settings, "multichannel_audio", true);'
+    if marker in text:
         print(f"Already patched: {path}")
         return
 
-    old_settings = '''\t\tobs_data_set_string(output_settings, "ndi_name", QT_TO_UTF8(output_name));
-\t\tobs_data_set_string(output_settings, "ndi_groups", QT_TO_UTF8(output_groups));
-\t\tcontext.output = obs_output_create("ndi_output", "NDI Main Output", output_settings, nullptr);
-\t\tobs_data_release(output_settings);
-'''
-    new_settings = '''\t\tobs_data_set_string(output_settings, "ndi_name", QT_TO_UTF8(output_name));
-\t\tobs_data_set_string(output_settings, "ndi_groups", QT_TO_UTF8(output_groups));
+    # DistroAV 6.2.1 uses tabs whose exact depth has changed between source
+    # archives/checkouts. Anchor on the unique Main Output creation statement
+    # rather than matching a whitespace-sensitive multi-line block.
+    create_pattern = re.compile(
+        r'(?P<indent>^[ \t]*)'
+        r'context\.output\s*=\s*obs_output_create\(\s*'
+        r'"ndi_output"\s*,\s*"NDI Main Output"\s*,\s*'
+        r'output_settings\s*,\s*nullptr\s*\)\s*;',
+        flags=re.MULTILINE,
+    )
+    matches = list(create_pattern.finditer(text))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Main Output creation: expected one exact semantic match, "
+            f"found {len(matches)}"
+        )
 
-\t\t// DistroAV Multichannel Main Output hotfix v0.1.0
-\t\t// OBS tracks are zero-based internally: 4 = Track 5, 5 = Track 6.
-\t\tobs_data_set_bool(output_settings, "multichannel_audio", true);
-\t\tobs_data_set_int(output_settings, "multichannel_track_a", 4);
-\t\tobs_data_set_int(output_settings, "multichannel_track_b", 5);
+    match = matches[0]
+    indent = match.group("indent")
+    injection = (
+        f'{indent}// DistroAV Multichannel Main Output hotfix v0.1.1\n'
+        f'{indent}// OBS tracks are zero-based internally: 4 = Track 5, 5 = Track 6.\n'
+        f'{indent}obs_data_set_bool(output_settings, "multichannel_audio", true);\n'
+        f'{indent}obs_data_set_int(output_settings, "multichannel_track_a", 4);\n'
+        f'{indent}obs_data_set_int(output_settings, "multichannel_track_b", 5);\n\n'
+    )
+    text = text[:match.start()] + injection + text[match.start():]
 
-\t\tcontext.output = obs_output_create("ndi_output", "NDI Main Output", output_settings, nullptr);
-\t\tif (context.output) {
-\t\t\tconst size_t multichannel_mixers = (size_t(1) << 4) | (size_t(1) << 5);
-\t\t\tobs_output_set_mixers(context.output, multichannel_mixers);
-\t\t\tobs_log(LOG_INFO,
-\t\t\t\t"DistroAV Multichannel Main Output hotfix enabled: Track 5 -> NDI 1-2, Track 6 -> NDI 3-4");
-\t\t}
-\t\tobs_data_release(output_settings);
-'''
-    text = replace_once(text, old_settings, new_settings, "Main Output settings")
+    # Configure both requested OBS mixes immediately after the output is created.
+    # Keep this separate from output creation so failure/null handling remains
+    # identical to upstream DistroAV.
+    release_pattern = re.compile(
+        r'(?P<indent>^[ \t]*)obs_data_release\(\s*output_settings\s*\)\s*;',
+        flags=re.MULTILINE,
+    )
+
+    # main-output.cpp contains one release in the support test and one in
+    # main_output_init(). Select the first release occurring after the unique
+    # context.output creation we just patched.
+    create_pos = text.index(
+        'context.output = obs_output_create("ndi_output", "NDI Main Output", output_settings, nullptr);'
+    )
+    release_match = release_pattern.search(text, create_pos)
+    if not release_match:
+        raise RuntimeError(
+            "Main Output settings release: could not find obs_data_release(output_settings) "
+            "after context.output creation"
+        )
+
+    indent = release_match.group("indent")
+    mixer_setup = (
+        f'{indent}if (context.output) {{\n'
+        f'{indent}\tconst size_t multichannel_mixers = (size_t(1) << 4) | (size_t(1) << 5);\n'
+        f'{indent}\tobs_output_set_mixers(context.output, multichannel_mixers);\n'
+        f'{indent}\tobs_log(LOG_INFO,\n'
+        f'{indent}\t\t"DistroAV Multichannel Main Output hotfix enabled: "\n'
+        f'{indent}\t\t"Track 5 -> NDI 1-2, Track 6 -> NDI 3-4");\n'
+        f'{indent}}}\n'
+    )
+    insert_at = release_match.end()
+    text = text[:insert_at] + "\n" + mixer_setup + text[insert_at:]
+
     path.write_text(text, encoding="utf-8", newline="\n")
     print(f"Patched: {path}")
 
@@ -330,7 +369,7 @@ def patch_main_output(path: Path) -> None:
 def write_notice(root: Path) -> None:
     notice = root / "MULTICHANNEL-HOTFIX.md"
     notice.write_text(
-        "# DistroAV Multichannel Main Output hotfix v0.1.0\n\n"
+        "# DistroAV Multichannel Main Output hotfix v0.1.1\n\n"
         "This tree was generated from the DistroAV 6.2.1 tag. The hotfix changes "
         "Main Output audio capture to OBS raw multi-track mode and packs:\n\n"
         "- OBS Track 5 left/right into NDI channels 1/2\n"
