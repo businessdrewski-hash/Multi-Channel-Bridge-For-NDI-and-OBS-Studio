@@ -1,4 +1,4 @@
-name: Build Unified Multichannel DistroAV for Windows
+name: Build Multichannel Bridge for DistroAV (Windows)
 
 on:
   workflow_dispatch:
@@ -13,9 +13,19 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-2022
+
     steps:
       - name: Check out bridge repository
         uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Content VERSION -Raw).Trim()
+          if (-not $version) { throw 'VERSION is empty.' }
+          "version=$version" >> $env:GITHUB_OUTPUT
 
       - name: Check out clean DistroAV 6.2.1
         uses: actions/checkout@v4
@@ -26,10 +36,11 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Apply unified sender and receiver patch
+      - name: Validate and apply bridge patch
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          python -m py_compile hotfix/scripts/patch_distroav.py
           python hotfix/scripts/patch_distroav.py distroav
 
       - name: Build custom DistroAV x64
@@ -40,13 +51,15 @@ jobs:
           & .github/scripts/Build-Windows.ps1 -Target x64 -Configuration RelWithDebInfo
           Pop-Location
 
-      - name: Create portable drag-and-drop package
+      - name: Create portable package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.version }}'
           $package = Join-Path $env:GITHUB_WORKSPACE 'obs-install'
           $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
           $built = Join-Path $env:GITHUB_WORKSPACE 'distroav\release\RelWithDebInfo\distroav'
+
           Remove-Item -Recurse -Force $package,$dist -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force $package,$dist | Out-Null
 
@@ -63,6 +76,7 @@ jobs:
           Copy-Item README.md $package
           Copy-Item INSTALL-BOTH-PCS.md $package
           Copy-Item RELEASE-NOTES.md $package
+          Copy-Item ROADMAP.md $package
           Copy-Item LICENSE-NOTICE.txt $package
           Copy-Item distroav/LICENSE "$package\DISTROAV-GPL-LICENSE.txt"
           Copy-Item tools/Install-MultichannelBridge.ps1 $package
@@ -70,14 +84,75 @@ jobs:
           Copy-Item tools/Uninstall-MultichannelBridge.ps1 $package
           Copy-Item tools/Uninstall-MultichannelBridge.cmd $package
 
-          $zip = Join-Path $dist 'NDI-Multichannel-Bridge-v0.3.0-alpha-Windows-x64.zip'
-          Compress-Archive -Path "$package\*" -DestinationPath $zip -Force
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  $(Split-Path $zip -Leaf)" | Set-Content -Encoding ascii (Join-Path $dist 'SHA256SUMS.txt')
+          @"
+          This binary was built from:
+          $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA
 
-      - name: Upload package
+          The modified DistroAV build is GPL-2.0-or-later. Preserve the license
+          notices and provide the complete corresponding source when redistributing.
+          "@ | Set-Content -Encoding utf8 "$package\SOURCE-CODE.txt"
+
+          $portableZip = Join-Path $dist "Multichannel-Bridge-for-DistroAV-v$version-Portable-Windows-x64.zip"
+          Compress-Archive -Path "$package\*" -DestinationPath $portableZip -Force
+
+      - name: Install Inno Setup compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $innoRoot = Join-Path $env:RUNNER_TEMP 'Inno Setup 6'
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $process = Start-Process -FilePath $installer -ArgumentList @(
+            '/VERYSILENT',
+            '/SUPPRESSMSGBOXES',
+            '/NORESTART',
+            '/SP-',
+            "/DIR=`"$innoRoot`""
+          ) -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Inno Setup installation failed with exit code $($process.ExitCode)."
+          }
+
+          $iscc = Join-Path $innoRoot 'ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe not found at $iscc" }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
+
+      - name: Build Windows EXE installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.version }}'
+          $package = Join-Path $env:GITHUB_WORKSPACE 'obs-install'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'installer\MultichannelBridge.iss'
+
+          & $env:ISCC /Qp "/DAppVersion=$version" "/DSourceRoot=$package" "/DOutputDir=$dist" $script
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
+
+          $setup = Join-Path $dist "Multichannel-Bridge-for-DistroAV-Setup-v$version.exe"
+          if (-not (Test-Path $setup)) { throw "Installer EXE was not produced: $setup" }
+
+      - name: Create checksums and verify release contents
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
+          $files = Get-ChildItem $dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name
+          if (-not ($files.Name -match '\.exe$')) { throw 'Release is missing the setup EXE.' }
+          if (-not ($files.Name -match 'Portable-Windows-x64\.zip$')) { throw 'Release is missing the portable ZIP.' }
+
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($file.Name)"
+          }
+          $lines | Set-Content -Encoding ascii (Join-Path $dist 'SHA256SUMS.txt')
+          Get-ChildItem $dist | Format-Table Name,Length,LastWriteTime
+
+      - name: Upload Windows release package
         uses: actions/upload-artifact@v4
         with:
-          name: NDI-Multichannel-Bridge-v0.3.0-alpha-Windows-x64
+          name: Multichannel-Bridge-for-DistroAV-v${{ steps.version.outputs.version }}-Windows-x64
           path: dist/*
           retention-days: 30
