@@ -27,6 +27,18 @@ int main()
   assert(merged->channels[2][0] == 3.0f);
   assert(merged->channels[3][0] == 4.0f);
 
+  // OBS can deliver selected mixer callbacks one 1024-sample quantum apart.
+  AudioPairAssembler shifted;
+  auto a1024 = make_block(10'000'000, 1.0f, 2.0f);
+  auto b1024 = make_block(31'333'333, 3.0f, 4.0f);
+  a1024.frames = b1024.frames = 1024;
+  for (auto &c : a1024.channels) c.resize(1024);
+  for (auto &c : b1024.channels) c.resize(1024);
+  assert(!shifted.push(0, std::move(a1024)));
+  auto shifted_merged = shifted.push(1, std::move(b1024));
+  assert(shifted_merged);
+  assert(shifted.realigned() == 1);
+
   TimelineMapper mapper(10'000'000ULL);
   const uint64_t first = mapper.map(100'000, 1'000'000'000ULL);
   const uint64_t second = mapper.map(110'000, 1'001'000'000ULL);

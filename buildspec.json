@@ -30,7 +30,7 @@
   },
   "name": "ndi-multichannel-bridge",
   "displayName": "NDI Multichannel Bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "NDI Multichannel Bridge contributors",
   "website": "https://github.com/businessdrewski-hash",
   "platformConfig": {

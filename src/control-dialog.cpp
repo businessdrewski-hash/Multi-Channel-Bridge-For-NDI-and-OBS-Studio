@@ -14,6 +14,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QSettings>
 #include <QPushButton>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -24,13 +25,24 @@ BridgeControlDialog::BridgeControlDialog(QWidget *parent) : QDialog(parent)
   resize(520, 430);
 
   auto *mainLayout = new QVBoxLayout(this);
-  auto *senderBox = new QGroupBox(obs_module_text("Dialog.Sender"), this);
-  auto *senderLayout = new QFormLayout(senderBox);
+  auto *roleBox = new QGroupBox(obs_module_text("Dialog.RoleBox"), this);
+  auto *roleLayout = new QFormLayout(roleBox);
+  role_ = new QComboBox(roleBox);
+  role_->addItem(obs_module_text("Dialog.RoleGame"), 0);
+  role_->addItem(obs_module_text("Dialog.RoleStream"), 1);
+  roleLayout->addRow(obs_module_text("Dialog.Role"), role_);
+  auto *roleNote = new QLabel(obs_module_text("Dialog.RoleNote"), roleBox);
+  roleNote->setWordWrap(true);
+  roleLayout->addRow(roleNote);
+  mainLayout->addWidget(roleBox);
 
-  ndiName_ = new QLineEdit(QStringLiteral("OBS Multichannel A/V"), senderBox);
-  ndiGroups_ = new QLineEdit(senderBox);
-  trackA_ = new QComboBox(senderBox);
-  trackB_ = new QComboBox(senderBox);
+  senderBox_ = new QGroupBox(obs_module_text("Dialog.Sender"), this);
+  auto *senderLayout = new QFormLayout(senderBox_);
+
+  ndiName_ = new QLineEdit(QStringLiteral("OBS Multichannel A/V"), senderBox_);
+  ndiGroups_ = new QLineEdit(senderBox_);
+  trackA_ = new QComboBox(senderBox_);
+  trackB_ = new QComboBox(senderBox_);
   for (int i = 0; i < MAX_AUDIO_MIXES; ++i) {
     const QString label = tr("OBS Track %1").arg(i + 1);
     trackA_->addItem(label, i);
@@ -45,29 +57,34 @@ BridgeControlDialog::BridgeControlDialog(QWidget *parent) : QDialog(parent)
   senderLayout->addRow(obs_module_text("Dialog.Pair34Track"), trackB_);
 
   auto *senderButtons = new QHBoxLayout;
-  startStop_ = new QPushButton(obs_module_text("Dialog.Start"), senderBox);
-  status_ = new QLabel(obs_module_text("Dialog.Stopped"), senderBox);
+  startStop_ = new QPushButton(obs_module_text("Dialog.Start"), senderBox_);
+  status_ = new QLabel(obs_module_text("Dialog.Stopped"), senderBox_);
   senderButtons->addWidget(startStop_);
   senderButtons->addWidget(status_, 1);
   senderLayout->addRow(senderButtons);
-  mainLayout->addWidget(senderBox);
+  mainLayout->addWidget(senderBox_);
 
-  auto *receiverBox = new QGroupBox(obs_module_text("Dialog.Receiver"), this);
-  auto *receiverLayout = new QFormLayout(receiverBox);
-  receiverNdiName_ = new QLineEdit(receiverBox);
-  receiverBaseName_ = new QLineEdit(QStringLiteral("Multichannel NDI"), receiverBox);
-  auto *createBundle = new QPushButton(obs_module_text("Dialog.CreateBundle"), receiverBox);
+  receiverBox_ = new QGroupBox(obs_module_text("Dialog.Receiver"), this);
+  auto *receiverLayout = new QFormLayout(receiverBox_);
+  receiverNdiName_ = new QLineEdit(receiverBox_);
+  receiverBaseName_ = new QLineEdit(QStringLiteral("Multichannel NDI"), receiverBox_);
+  auto *createBundle = new QPushButton(obs_module_text("Dialog.CreateBundle"), receiverBox_);
   receiverLayout->addRow(obs_module_text("Dialog.NDIName"), receiverNdiName_);
   receiverLayout->addRow(obs_module_text("Dialog.BundleName"), receiverBaseName_);
   receiverLayout->addRow(createBundle);
-  auto *note = new QLabel(obs_module_text("Dialog.BundleNote"), receiverBox);
+  auto *note = new QLabel(obs_module_text("Dialog.BundleNote"), receiverBox_);
   note->setWordWrap(true);
   receiverLayout->addRow(note);
-  mainLayout->addWidget(receiverBox);
+  mainLayout->addWidget(receiverBox_);
+
+  health_ = new QLabel(obs_module_text("Dialog.HealthReady"), this);
+  health_->setWordWrap(true);
+  mainLayout->addWidget(health_);
 
   auto *closeButton = new QPushButton(obs_module_text("Dialog.Close"), this);
   mainLayout->addWidget(closeButton, 0, Qt::AlignRight);
 
+  connect(role_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] { saveSettings(); applyRoleUi(); });
   connect(startStop_, &QPushButton::clicked, this, [this] {
     if (output_ && obs_output_active(output_))
       stopOutput();
@@ -81,10 +98,13 @@ BridgeControlDialog::BridgeControlDialog(QWidget *parent) : QDialog(parent)
   timer_->setInterval(500);
   connect(timer_, &QTimer::timeout, this, [this] { refreshStatus(); });
   timer_->start();
+  loadSettings();
+  applyRoleUi();
 }
 
 BridgeControlDialog::~BridgeControlDialog()
 {
+  saveSettings();
   stopOutput();
 }
 
@@ -121,6 +141,7 @@ void BridgeControlDialog::startOutput()
     obs_output_release(output_);
     output_ = nullptr;
   }
+  saveSettings();
   refreshStatus();
 }
 
@@ -140,6 +161,10 @@ void BridgeControlDialog::refreshStatus()
   const bool active = output_ && obs_output_active(output_);
   startStop_->setText(active ? obs_module_text("Dialog.Stop") : obs_module_text("Dialog.Start"));
   status_->setText(active ? obs_module_text("Dialog.Running") : obs_module_text("Dialog.Stopped"));
+  if (role_->currentData().toInt() == 0)
+    health_->setText(active ? obs_module_text("Dialog.HealthSending") : obs_module_text("Dialog.HealthGameIdle"));
+  else
+    health_->setText(obs_module_text("Dialog.HealthReceiving"));
 }
 
 QString BridgeControlDialog::uniqueSourceName(const QString &base) const
@@ -197,4 +222,39 @@ void BridgeControlDialog::createReceiverBundle()
     QMessageBox::information(this, windowTitle(), obs_module_text("Dialog.BundleCreated"));
   else
     QMessageBox::warning(this, windowTitle(), obs_module_text("Dialog.BundlePartial"));
+}
+
+
+void BridgeControlDialog::applyRoleUi()
+{
+  const bool game = role_->currentData().toInt() == 0;
+  senderBox_->setVisible(game);
+  receiverBox_->setVisible(!game);
+  if (!game && output_)
+    stopOutput();
+}
+
+void BridgeControlDialog::loadSettings()
+{
+  QSettings s(QStringLiteral("BusinessDrewski"), QStringLiteral("NDIMultichannelBridge"));
+  role_->setCurrentIndex(s.value(QStringLiteral("role"), 0).toInt());
+  ndiName_->setText(s.value(QStringLiteral("sendName"), QStringLiteral("DrewskiGame")).toString());
+  ndiGroups_->setText(s.value(QStringLiteral("groups"), QString()).toString());
+  trackA_->setCurrentIndex(s.value(QStringLiteral("trackA"), 4).toInt());
+  trackB_->setCurrentIndex(s.value(QStringLiteral("trackB"), 5).toInt());
+  receiverNdiName_->setText(s.value(QStringLiteral("receiveName"), QString()).toString());
+  receiverBaseName_->setText(s.value(QStringLiteral("bundleName"), QStringLiteral("Multichannel NDI")).toString());
+}
+
+void BridgeControlDialog::saveSettings()
+{
+  if (!role_) return;
+  QSettings s(QStringLiteral("BusinessDrewski"), QStringLiteral("NDIMultichannelBridge"));
+  s.setValue(QStringLiteral("role"), role_->currentIndex());
+  s.setValue(QStringLiteral("sendName"), ndiName_->text());
+  s.setValue(QStringLiteral("groups"), ndiGroups_->text());
+  s.setValue(QStringLiteral("trackA"), trackA_->currentIndex());
+  s.setValue(QStringLiteral("trackB"), trackB_->currentIndex());
+  s.setValue(QStringLiteral("receiveName"), receiverNdiName_->text());
+  s.setValue(QStringLiteral("bundleName"), receiverBaseName_->text());
 }
