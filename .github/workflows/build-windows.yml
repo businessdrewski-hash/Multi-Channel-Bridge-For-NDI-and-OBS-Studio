@@ -25,7 +25,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $version = (Get-Content VERSION -Raw).Trim()
           if (-not $version) { throw 'VERSION is empty.' }
+          if ($version -notmatch '^v?(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)') {
+            throw "VERSION must begin with major.minor.patch, for example 0.3.1-alpha. Found: $version"
+          }
+          $numericVersion = "$($Matches.major).$($Matches.minor).$($Matches.patch).0"
           "version=$version" >> $env:GITHUB_OUTPUT
+          "numeric_version=$numericVersion" >> $env:GITHUB_OUTPUT
 
       - name: Check out clean DistroAV 6.2.1
         uses: actions/checkout@v4
@@ -131,11 +136,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $version = '${{ steps.version.outputs.version }}'
+          $numericVersion = '${{ steps.version.outputs.numeric_version }}'
           $package = Join-Path $env:GITHUB_WORKSPACE 'obs-install'
           $dist = Join-Path $env:GITHUB_WORKSPACE 'dist'
           $script = Join-Path $env:GITHUB_WORKSPACE 'installer\MultichannelBridge.iss'
 
-          & $env:ISCC /Qp "/DAppVersion=$version" "/DSourceRoot=$package" "/DOutputDir=$dist" $script
+          & $env:ISCC /Qp "/DAppVersion=$version" "/DAppNumericVersion=$numericVersion" "/DSourceRoot=$package" "/DOutputDir=$dist" $script
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
 
           $setup = Join-Path $dist "Multichannel-Bridge-for-DistroAV-Setup-v$version.exe"
