@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply NDI Multichannel Bridge v0.3.0-alpha to DistroAV 6.2.1.
+"""Apply Multichannel Bridge for DistroAV v0.3.1-alpha to DistroAV 6.2.1.
 
 The resulting custom DistroAV package is installed on BOTH computers. The OBS
 Dock selects Gaming PC / Sender or Stream PC / Receiver.
@@ -20,7 +20,7 @@ import re
 import shutil
 from pathlib import Path
 
-PATCH_MARKER = "NDI Multichannel Bridge v0.3.0-alpha"
+PATCH_MARKER = "Multichannel Bridge for DistroAV v0.3.1-alpha"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -169,7 +169,7 @@ def patch_ndi_source(path: Path) -> None:
     )
     old = "\tobs_source_output_audio(obs_source, obs_audio_frame);\n"
     new = (
-        "\t// NDI Multichannel Bridge receiver hook: split raw planar NDI channels\n"
+        "\t// Multichannel Bridge for DistroAV receiver hook: split raw planar NDI channels\n"
         "\t// before OBS remixes the source to the profile speaker layout.\n"
         "\tconst bool suppress_original_audio =\n"
         "\t\tmcb_receiver_route_audio(obs_source, obs_audio_frame, channelCount);\n"
@@ -197,7 +197,7 @@ def patch_ndi_output(path: Path) -> None:
     )
 
     state_types = r'''
-// NDI Multichannel Bridge v0.3.0-alpha
+// Multichannel Bridge for DistroAV v0.3.1-alpha
 // A bounded FIFO is required because OBS uses one shared raw-output frame
 // counter for all selected mixers. Adjacent mixer callbacks therefore normally
 // carry timestamps one 1024-frame block apart even when their samples represent
@@ -492,9 +492,9 @@ def copy_bridge_files(root: Path, bridge_dir: Path) -> None:
 
 def write_notice(root: Path) -> None:
     (root / "MULTICHANNEL-BRIDGE.md").write_text(
-        "# NDI Multichannel Bridge v0.3.0-alpha\n\n"
+        "# Multichannel Bridge for DistroAV v0.3.1-alpha\n\n"
         "Custom DistroAV 6.2.1 build. Install the same package on both PCs, then use "
-        "Docks > NDI Multichannel Bridge to select Gaming PC / Sender or Stream PC / Receiver.\n\n"
+        "Docks > Multichannel Bridge for DistroAV to select Gaming PC / Sender or Stream PC / Receiver.\n\n"
         "Sender defaults: OBS Track 5 -> NDI channels 1-2; OBS Track 6 -> channels 3-4.\n"
         "Receiver: one normal DistroAV NDI Source provides video while the bridge exposes the two stereo "
         "pairs as independent OBS audio-only sources.\n\n"

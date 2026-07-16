@@ -1,63 +1,79 @@
 # Troubleshooting
 
+## Setup EXE fails or closes
+
+Use the EXE installer rather than launching files from inside a ZIP. Close OBS and run setup as Administrator. Review:
+
+```text
+C:\ProgramData\Multichannel Bridge for DistroAV\Installer\install-script.log
+C:\ProgramData\Multichannel Bridge for DistroAV\install.log
+```
+
+The portable ZIP remains available for debugging.
+
 ## The dock is missing
 
-Search **Help → Log Files → View Current Log** for:
+Search the OBS log for:
 
-- `[multichannel-bridge] Registered receiver proxy sources`
-- `[multichannel-bridge] Dock initialized`
+```text
+[multichannel-bridge] Registered receiver proxy sources
+[multichannel-bridge] Dock initialized
+```
 
-The dock is under **Docks → NDI Multichannel Bridge**. DistroAV still reports version 6.2.1; the bridge dock/log markers identify the custom build.
+The dock is under **Docks → Multichannel Bridge for DistroAV**. DistroAV still reports its upstream base version; the bridge log markers identify the modified build.
 
-If the log says `Skipping module 'ndi-multichannel-bridge', is disabled`, that refers to the obsolete standalone alpha. The integrated v0.3.0 build lives inside `distroav.dll`; the installer removes the obsolete DLL.
+## OBS says the old multichannel plugin is missing
 
-## Gaming PC has video but no audio
+Version 0.3.1 is integrated into `distroav.dll`; it does not use `ndi-multichannel-bridge.dll`. Re-run the EXE installer with stale Plugin Manager cleanup enabled. It resets `modules.json` only when the exact legacy bridge ID is present and keeps a backup.
 
-The sender dock must show **ACTIVE**, and **paired** must rise.
+## Two DistroAV menus appear
 
-1. Confirm this PC is **Gaming PC / Sender**.
+OBS is loading DistroAV twice. The installer disables the common duplicate locations automatically. To inspect manually:
+
+```powershell
+Get-ChildItem `
+  "C:\Program Files\obs-studio", `
+  "$env:ProgramData\obs-studio", `
+  "$env:APPDATA\obs-studio", `
+  "$env:LOCALAPPDATA\obs-studio" `
+  -Filter distroav.dll -Recurse -ErrorAction SilentlyContinue |
+Select-Object FullName,Length,LastWriteTime
+```
+
+There should be one active copy for the OBS installation being used.
+
+## Gaming PC has video but no multichannel audio
+
+1. Confirm the role is **Gaming PC / Sender**.
 2. Confirm DistroAV Main Output is enabled.
-3. Route desktop/game to Track A and mic to Track B in **Advanced Audio Properties**.
-4. Use two different tracks.
-5. Make sure neither source is **Monitor Only (mute output)**.
-6. Use 48 kHz OBS audio.
+3. Route desktop/game to Track A and mic to Track B.
+4. Use two different tracks at 48 kHz.
+5. Confirm `Paired` rises and `Discarded`/`Silence fallback` remain near zero.
 
-A timestamp delta near 21.333 ms at 48 kHz is normal for two selected OBS raw mixes and should still produce a continuously rising paired count. A continuously rising discarded count means the tracks are more than one full audio block apart or their block sizes differ. A rising fallback count means one selected OBS mix stopped producing callbacks.
+A stable timestamp delta near 21.333 ms at 48 kHz is normal for the two selected OBS mixes.
 
 ## Stream PC gets video but no split audio
 
-1. Confirm this PC is **Stream PC / Receiver**.
-2. Add one normal DistroAV NDI Source and select the combined gaming-PC feed.
-3. Keep NDI audio enabled in that source.
-4. Select the OBS source name in the bridge dock.
-5. Click **Create / repair split audio sources**.
-6. Confirm `ATTACHED`, split outputs `ready`, and `4 channels detected`.
+1. Confirm **Stream PC / Receiver** role.
+2. Use one normal DistroAV NDI Source with audio enabled.
+3. Select that OBS source in the bridge dock.
+4. Create/repair the split sources.
+5. Confirm `Detected channels: 4` and both outputs are active.
 
-If only two channels are detected, the gaming PC is sending ordinary stereo, the sender role is not active, or the wrong NDI source was selected.
+## Audio skips or jumps
 
-## Duplicate or downmixed audio
+- Start with NDI Frame Sync disabled on the combined receiver source.
+- Remove old separate NDI desktop/mic sources.
+- Check whether discarded, fallback, or missing counters increased.
+- Inspect both OBS logs for reconnects, buffering changes, source rehooks, or output restarts.
 
-Keep **Suppress the original 4-channel audio after both split sources are ready** checked. The custom DistroAV receiver then skips only the original audio submission after both proxy sources exist; video continues normally.
+## Uninstall fails
 
-Remove or mute the old separate `NDI Desktop Audio` and `NDI MIC only` sources during testing.
+Close OBS before uninstalling. Review:
 
-## OBS reports a missing old source type
+```text
+C:\ProgramData\Multichannel Bridge for DistroAV\Installer\uninstall-script.log
+C:\ProgramData\Multichannel Bridge for DistroAV\uninstall.log
+```
 
-Delete the obsolete `NDI Multichannel Video` source. v0.3.0 uses:
-
-- one normal DistroAV NDI Source for video/input selection
-- `MCB Desktop / Game`
-- `MCB Microphone`
-
-## Wrong DistroAV copy loads
-
-Only one `distroav.dll` should be visible to OBS. Check both:
-
-- `C:\Program Files\obs-studio\obs-plugins\64bit\distroav.dll`
-- `%APPDATA%\obs-studio\plugins\distroav\bin\64bit\distroav.dll`
-
-The installer backs up and disables the common per-user duplicate so the integrated custom build is the only DistroAV copy OBS can load.
-
-## Uninstall
-
-Close OBS and double-click `Uninstall-MultichannelBridge.cmd`. It restores the system-wide and per-user DistroAV installations backed up before the first bridge install when those backups are available.
+The uninstaller refuses to overwrite a `distroav.dll` that changed after bridge installation unless the PowerShell helper is run manually with `-ForceRestore`.

@@ -1,7 +1,7 @@
 # Multichannel Bridge for DistroAV
 
 > Experimental modified DistroAV build for two-PC OBS setups  
-> Current version: **0.3.0-alpha**  
+> Current version: **0.3.1-alpha**  
 > Based on: **DistroAV 6.2.1**
 
 Multichannel Bridge for DistroAV sends one OBS video output together with two independent stereo audio mixes through a single NDI® sender. On the receiving PC, those four audio channels are split back into separate OBS mixer sources before OBS downmixes them.
@@ -88,6 +88,7 @@ Audio and video are still separate NDI frame types, but they now share one sende
 - Duplicate-audio suppression on the receiver
 - Sender and receiver diagnostics
 - One package for both PCs, with selectable Sender and Receiver roles
+- Windows EXE installer with backup, duplicate cleanup, hash verification, upgrade support, and uninstall restoration
 
 ### Possible future expansion
 
@@ -115,18 +116,26 @@ Compatibility outside that environment is not guaranteed.
 
 ## Installation
 
-Install the same build on both computers. Future releases should use the included Windows `.exe` installer.
+Install the same build on both computers. The release artifact includes a normal Windows `.exe` installer and a portable ZIP fallback.
 
-Before installing:
+### Recommended EXE installation
 
-1. Close OBS.
-2. Back up your OBS profile and scene collection.
-3. Remove obsolete standalone `ndi-multichannel-bridge.dll` builds.
-4. Make sure only one active `distroav.dll` exists across OBS plugin locations.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.3.1-alpha.exe`.
+2. Close OBS completely.
+3. Run the installer as Administrator on the gaming PC and stream PC.
+4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
+5. The installer backs up the current DistroAV installation, removes the obsolete standalone bridge, disables duplicate ProgramData/AppData DistroAV copies, installs the modified build, verifies its hash, and adds a Windows uninstaller.
+6. Start OBS and choose the correct role in **Docks → Multichannel Bridge for DistroAV**.
+
+The installer is not Authenticode-signed unless the maintainer adds a code-signing certificate, so Windows may display an **Unknown publisher** warning. Verify the release SHA-256 checksum before running it.
+
+### Portable fallback
+
+The portable ZIP still contains the PowerShell and `.cmd` installers for debugging or manual deployment. Close OBS before using either method.
 
 ### Gaming PC
 
-1. Open **Docks → NDI Multichannel Bridge**.
+1. Open **Docks → Multichannel Bridge for DistroAV**.
 2. Select **Gaming PC / Sender**.
 3. Choose the two OBS tracks, normally Track 5 and Track 6.
 4. Route game/program audio to Track 5 and microphone audio to Track 6 in **Advanced Audio Properties**.
@@ -135,7 +144,7 @@ Before installing:
 
 ### Stream PC
 
-1. Open **Docks → NDI Multichannel Bridge**.
+1. Open **Docks → Multichannel Bridge for DistroAV**.
 2. Select **Stream PC / Receiver**.
 3. Add one ordinary DistroAV NDI Source and select the Gaming PC feed.
 4. Attach the bridge to that source.
@@ -209,7 +218,7 @@ C:\ProgramData\obs-studio\plugins\distroav\bin\64bit\distroav.dll
 
 ### Missing old multichannel plugin warning
 
-Version 0.3 is integrated into `distroav.dll`. It does not use the old standalone `ndi-multichannel-bridge.dll`. Remove the obsolete module entry from OBS Plugin Manager if OBS still reports it as missing.
+Version 0.3.1 is integrated into `distroav.dll`. It does not use the old standalone `ndi-multichannel-bridge.dll`. Remove the obsolete module entry from OBS Plugin Manager if OBS still reports it as missing.
 
 ---
 
@@ -271,7 +280,7 @@ This software is provided **as is**, without warranty of any kind. Use it first 
 
 ## Project status
 
-**0.3.0-alpha is experimental.** It has been tested in a specific two-PC environment but has not undergone broad hardware, network, regression, security, or broadcast-certification testing.
+**0.3.1-alpha is experimental.** It has been tested in a specific two-PC environment but has not undergone broad hardware, network, regression, security, or broadcast-certification testing.
 
 Bridge additions and documentation:
 

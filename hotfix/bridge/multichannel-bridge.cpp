@@ -43,7 +43,7 @@ constexpr const char *kSection = "NDIMultichannelBridge";
 constexpr const char *kDockId = "distroav_multichannel_bridge_v030";
 constexpr const char *kProgramSourceId = "ndi_multichannel_bridge_program_audio";
 constexpr const char *kMicSourceId = "ndi_multichannel_bridge_mic_audio";
-constexpr const char *kVersion = "0.3.0-alpha";
+constexpr const char *kVersion = "0.3.1-alpha";
 constexpr const char *kDefaultProgramName = "MCB Desktop / Game";
 constexpr const char *kDefaultMicName = "MCB Microphone";
 
@@ -487,7 +487,7 @@ public:
 		auto *body = new QWidget(scroll);
 		auto *layout = new QVBoxLayout(body);
 
-		auto *title = new QLabel(QString("<b>NDI Multichannel Bridge %1</b>").arg(kVersion), body);
+		auto *title = new QLabel(QString("<b>Multichannel Bridge for DistroAV %1</b>").arg(kVersion), body);
 		layout->addWidget(title);
 		auto *intro = new QLabel(
 			"Install the same custom DistroAV package on both PCs. Select exactly one role on each PC, "
@@ -740,7 +740,7 @@ private:
 					    ? static_cast<double>(now - router.last_packet_ns()) / 1e6
 					    : -1.0;
 		return QString(
-			       "NDI Multichannel Bridge %1\nRole: %2\nOBS audio rate: %3 Hz\n"
+			       "Multichannel Bridge for DistroAV %1\nRole: %2\nOBS audio rate: %3 Hz\n"
 			       "Sender active: %4\nTracks: %5 / %6\nPaired: %7\nDiscarded: %8\nSilence fallback: %9\n"
 			       "Last timestamp delta: %10 ms\nQueues: %11 / %12\nSender audio age: %13 ms\n"
 			       "Receiver attached: %14\nSplit outputs ready: %15\nSplit outputs active: %16\nDetected channels: %17\nPackets: %18\n"
@@ -907,7 +907,7 @@ void mcb_init(QWidget *main_window)
 	ensure_defaults();
 	set_role_cache(read_role_from_config());
 	g_dock = new BridgeDock(main_window);
-	if (!obs_frontend_add_dock_by_id(kDockId, "NDI Multichannel Bridge", g_dock)) {
+	if (!obs_frontend_add_dock_by_id(kDockId, "Multichannel Bridge for DistroAV", g_dock)) {
 		delete g_dock;
 		g_dock = nullptr;
 		obs_log(LOG_WARNING, "[multichannel-bridge] Could not add dock; dock ID is already registered");

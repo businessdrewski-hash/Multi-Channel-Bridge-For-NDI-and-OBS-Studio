@@ -1,22 +1,20 @@
-# Validation notes for v0.3.0-alpha
+# Validation notes for v0.3.1-alpha
 
-Performed in the source-generation environment:
+Source-side checks:
 
 - `patch_distroav.py` passes Python bytecode compilation.
-- The patcher was run end-to-end against a clean mock DistroAV 6.2.1 tree containing the exact source anchors used by the official files.
-- The official DistroAV 6.2.1 `CMakeLists.txt`, `plugin-main.cpp`, `main-output.cpp`, `ndi-output.cpp`, and `ndi-source.cpp` anchors were inspected against the patch rules.
-- OBS's official raw-output callback was reviewed: it uses one shared `total_audio_frames` counter across selected mixers, which explains the stable one-block timestamp phase and is why v0.3.0 accepts that delta.
-- Patch verification confirmed the CMake source list, module initialization/shutdown, sender Main Output configuration, raw multi-track callback, receiver raw-audio hook, and dock source registration.
-- `multichannel-bridge.cpp` passed Clang 17 C++17 syntax checking with warnings enabled against OBS/Qt interface stubs.
-- The injected sender callback and receiver hook passed C++17 syntax checking in the patched mock tree.
-- A timestamp-queue simulation of the observed 21.333 ms/one-block callback phase produced continuous pairing with no repeated discards; gaps larger than one block still discard only the stale FIFO front.
-- The queue simulation also covered a temporary missing-track period, silence fallback, and clean re-pairing after that track resumed.
+- The patch rules retain structural verification for the sender, receiver hook, dock, and DistroAV build list.
+- Product-facing version and dock strings were updated without changing saved configuration keys or proxy source IDs.
+- The EXE installer validates the OBS root, blocks installation while OBS runs, invokes an elevated PowerShell helper, records logs, and provides an uninstall path.
+- The helper backs up the original DistroAV install, removes obsolete v0.2 files, disables duplicate plugin locations, copies the payload, verifies the DLL hash, and confirms a single active common-path DLL.
+- The release workflow requires both the EXE and portable ZIP before producing checksums.
 
-Not performed here:
+Authoritative tests still required from GitHub Actions and Windows:
 
-- Linking against the real Windows OBS 32.1.2/DistroAV 6.2.1 build environment.
-- Loading the compiled DLL in OBS.
-- Live NDI sender/receiver testing on the two physical PCs.
-- Long-duration drift, reconnect, recording, and live-production validation.
+- Real DistroAV/OBS compilation and linking.
+- Inno Setup script compilation.
+- Fresh install, upgrade, repair, and uninstall on Windows.
+- OBS load with exactly one DistroAV menu and the renamed bridge dock.
+- Long-duration A/V sync, reconnect, Frame Sync on/off, recording, and stream tests.
 
-The included GitHub Actions workflow is the authoritative Windows compile test. Treat this as controlled-test alpha software until the workflow passes and a local A/V sync recording is verified.
+Treat this as controlled-test alpha software until those tests pass.

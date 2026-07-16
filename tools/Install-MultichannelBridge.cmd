@@ -1,9 +1,12 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process PowerShell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File ""%~dp0Install-MultichannelBridge.ps1""'"
-if errorlevel 1 (
-  echo Installation did not complete successfully.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-MultichannelBridge.ps1" -CleanLegacyPluginManager
+set "ERR=%ERRORLEVEL%"
+echo.
+if not "%ERR%"=="0" (
+  echo Installation failed. Review the error above.
 ) else (
-  echo Installation command finished. Review the Administrator PowerShell window for details.
+  echo Installation completed successfully.
 )
 pause
+exit /b %ERR%

@@ -1,9 +1,12 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process PowerShell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File ""%~dp0Uninstall-MultichannelBridge.ps1""'"
-if errorlevel 1 (
-  echo Uninstall did not complete successfully.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Uninstall-MultichannelBridge.ps1"
+set "ERR=%ERRORLEVEL%"
+echo.
+if not "%ERR%"=="0" (
+  echo Uninstallation failed. Review the error above.
 ) else (
-  echo Uninstall command finished. Review the Administrator PowerShell window for details.
+  echo Uninstallation completed successfully.
 )
 pause
+exit /b %ERR%
