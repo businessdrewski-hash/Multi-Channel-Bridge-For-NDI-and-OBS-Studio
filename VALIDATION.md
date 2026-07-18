@@ -1,20 +1,30 @@
-# Validation notes for v0.3.1-alpha
+# Validation notes for v0.5.0-alpha1
 
-Source-side checks:
+Completed in the source-generation environment:
 
-- `patch_distroav.py` passes Python bytecode compilation.
-- The patch rules retain structural verification for the sender, receiver hook, dock, and DistroAV build list.
-- Product-facing version and dock strings were updated without changing saved configuration keys or proxy source IDs.
-- The EXE installer validates the OBS root, blocks installation while OBS runs, invokes an elevated PowerShell helper, records logs, and provides an uninstall path.
-- The helper backs up the original DistroAV install, removes obsolete v0.2 files, disables duplicate plugin locations, copies the payload, verifies the DLL hash, and confirms a single active common-path DLL.
-- The release workflow requires both the EXE and portable ZIP before producing checksums.
+- Python patcher syntax validation
+- GitHub Actions workflow YAML parse validation
+- Sender Sync Core 2.0 C++17 compilation with `-Wall -Wextra -Werror`
+- Sender tests for canonical mix timestamps, 10,000-cycle bounded pairing, backward timestamp recovery, manual re-anchor, missing-track silence fallback, oversized input rejection, and the one-megabyte state-size ceiling
+- A/V Governor 1.2 C++17 compilation and existing standalone recovery tests
+- Static game-PC callback audit rejecting dynamic containers, allocation/growth calls, mutex waits, UI work, file work, and callback logging
+- Parameter-path audit covering defaults, reads/runtime paths, and writes for all 20 saved settings
+- Repository version and required-file checks
 
-Authoritative tests still required from GitHub Actions and Windows:
+Design properties enforced by code and release tests:
 
-- Real DistroAV/OBS compilation and linking.
-- Inno Setup script compilation.
-- Fresh install, upgrade, repair, and uninstall on Windows.
-- OBS load with exactly one DistroAV menu and the renamed bridge dock.
-- Long-duration A/V sync, reconnect, Frame Sync on/off, recording, and stream tests.
+- Sender sample storage is fixed after construction.
+- Sender raw-audio callbacks never wait for another callback.
+- UI/control actions use atomic generation requests.
+- Sender queues have a fixed four-block ceiling.
+- Monitoring peak scans and the dock timer stop while the dock is hidden.
+- Receiver fade scratch storage is fixed-size.
 
-Treat this as controlled-test alpha software until those tests pass.
+Not completed in this environment:
+
+- Full Windows link/load test against OBS and DistroAV
+- Inno Setup EXE compilation
+- Multi-hour live NDI validation on two physical PCs
+- Fault injection against real capture, USB audio, and network hardware
+
+The GitHub Actions Windows job is the authoritative compile and packaging test. Production use should follow long-duration recording tests on the target computers before a live stream.

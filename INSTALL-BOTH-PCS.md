@@ -1,95 +1,53 @@
-# Install and use on both PCs
+# Install on both PCs
 
-## 1. Build once on GitHub
+Install the same `0.5.0-alpha1` package on the gaming PC and stream PC.
 
-1. Replace the repository contents with this source package, including the hidden `.github` folder.
-2. Open **Actions → Build Multichannel Bridge for DistroAV (Windows)**.
-3. Run the workflow.
-4. Download `Multichannel-Bridge-for-DistroAV-v0.3.1-alpha-Windows-x64` after it succeeds.
-5. Extract the downloaded GitHub artifact.
+## Recommended EXE installation
 
-The artifact contains:
-
-- `Multichannel-Bridge-for-DistroAV-Setup-v0.3.1-alpha.exe` — recommended installer
-- `Multichannel-Bridge-for-DistroAV-v0.3.1-alpha-Portable-Windows-x64.zip` — portable/debug fallback
-- `SHA256SUMS.txt`
-
-## 2. Install the same EXE on both PCs
-
-1. Close OBS completely.
-2. Verify the setup EXE against `SHA256SUMS.txt`.
-3. Run the setup EXE as Administrator.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1.exe`.
+2. Close OBS completely.
+3. Run setup as Administrator.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
-5. Leave legacy Plugin Manager cleanup enabled unless there is a reason not to reset a stale v0.2 entry.
-6. Repeat with the exact same setup EXE on the other PC.
-7. Start OBS on both PCs.
+5. Repeat on the other PC.
+6. Open **Docks -> Multichannel Bridge for DistroAV** and choose the correct role.
 
-The installer:
+The installer backs up DistroAV, removes obsolete bridge files, disables common duplicate DistroAV copies, verifies the installed DLL, and adds an uninstaller.
 
-- backs up the pre-bridge DistroAV DLL and data once;
-- removes the obsolete standalone `ndi-multichannel-bridge.dll`;
-- disables duplicate DistroAV copies in ProgramData and the current user's plugin folders;
-- installs and hash-verifies the custom `distroav.dll`;
-- registers a normal Windows uninstaller;
-- preserves the original backup across bridge upgrades.
+## Gaming PC
 
-Because the EXE is not code-signed by default, Windows may show **Unknown publisher**. Use the supplied SHA-256 file to verify it.
+1. Select **Gaming PC / Sender**.
+2. Confirm the role.
+3. Use two different OBS tracks; defaults are 5 and 6.
+4. Route game/program audio to Track 5 and mic to Track 6 in Advanced Audio Properties.
+5. Apply settings.
+6. Enable DistroAV Main Output.
+7. Confirm `Paired` rises and `Discarded`, `Silence fallback`, `Oversized`, and `Contention` remain near zero.
+8. Use **Re-anchor sync** for a timing-only refresh or **Restart Bridge** to recreate the complete sender.
 
-## 3. Gaming PC setup
+## Stream PC
 
-1. Open **Docks → Multichannel Bridge for DistroAV**.
-2. Select **Gaming PC — send video + two stereo OBS tracks**.
-3. Tick the role-confirmation box.
-4. Leave Track A/Track B at **5/6**, or choose two different OBS tracks.
-5. Click **Apply role and settings**.
-6. In **Edit → Advanced Audio Properties**:
-   - route desktop/game/program audio to Track A;
-   - route microphone audio to Track B;
-   - do not use **Monitor Only (mute output)** for either mix.
-7. Remove old separate DistroAV audio-only filters while testing the combined feed.
-8. Open **Tools → DistroAV Output Settings** and enable Main Output.
-9. Confirm the dock shows **ACTIVE**, both meters move, and `Paired` continuously rises.
-
-Default mapping:
-
-- OBS Track 5 L/R → NDI channels 1/2
-- OBS Track 6 L/R → NDI channels 3/4
-
-## 4. Stream PC setup
-
-1. Open **Docks → Multichannel Bridge for DistroAV**.
-2. Select **Stream PC — receive and split the four NDI channels**.
-3. Confirm the role and apply it.
-4. Add one normal **DistroAV NDI Source** and select the gaming-PC Main Output.
-5. Keep that source's NDI audio enabled.
-6. In the bridge dock, refresh and select the OBS source by its OBS source name.
+1. Add one normal DistroAV NDI Source for the gaming-PC Main Output.
+2. Select **Stream PC / Receiver** in the bridge dock.
+3. Select that OBS source.
+4. Leave A/V Governor and automatic source timing enabled.
+5. Click **Create / repair split audio sources**.
+6. Confirm `MCB Desktop / Game` and `MCB Microphone` appear separately.
 7. Keep original-audio suppression enabled.
-8. Click **Create / repair split audio sources in current scene**.
-9. Confirm these mixer sources appear independently:
-   - `MCB Desktop / Game`
-   - `MCB Microphone`
-10. Route them to stream and recording tracks normally.
+8. Confirm the governor reaches `LOCKED`.
 
-Begin testing with NDI Frame Sync disabled on the combined source. Compare with it enabled only when there is a specific reason to reclock the feed.
+Recommended receiver timing is applied automatically:
 
-## 5. Healthy status
+```text
+NDI Frame Sync: Off
+Sync mode: Source Timecode
+Audio: Enabled
+Shared playout delay: 120 ms
+Gradual video correction: On
+Atomic re-lock samples: 12 over at least 1 second
+```
 
-### Gaming PC
+After setup, confirm the governor reaches `LOCKED`. Use **Copy A/V flight recorder** immediately after any jump, stall, or unexpected cut.
 
-- `Sender active: yes`
-- `Paired` rising continuously
-- `Discarded: 0`
-- `Silence fallback: 0`
-- queues returning to `0 / 0`
+## Uninstall
 
-### Stream PC
-
-- `Receiver attached: yes`
-- split outputs ready and active
-- `Detected channels: 4`
-- packet count rising
-- missing program/mic counters at zero
-
-## 6. Uninstall
-
-Close OBS and use **Settings → Apps → Installed apps → Multichannel Bridge for DistroAV → Uninstall**. The uninstaller restores the pre-bridge DistroAV backup when available. Duplicate DistroAV copies disabled during installation are intentionally not restored automatically, because doing so would recreate duplicate plugin loading; their backups remain under ProgramData for manual recovery.
+Close OBS, then use **Windows Settings -> Apps -> Installed apps -> Multichannel Bridge for DistroAV -> Uninstall**. The pre-bridge DistroAV backup is restored when available.

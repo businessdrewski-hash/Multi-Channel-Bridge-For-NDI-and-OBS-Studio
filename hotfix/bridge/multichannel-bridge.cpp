@@ -1,4 +1,6 @@
 #include "multichannel-bridge.h"
+#include "av-governor.h"
+#include "sender-sync-core.h"
 
 #include "main-output.h"
 #include "plugin-main.h"
@@ -10,19 +12,27 @@
 #include <util/platform.h>
 
 #include <QApplication>
+#include <QAction>
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QHideEvent>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QMetaObject>
 #include <QProgressBar>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QScrollArea>
+#include <QShowEvent>
 #include <QSpinBox>
 #include <QString>
 #include <QTimer>
@@ -43,9 +53,41 @@ constexpr const char *kSection = "NDIMultichannelBridge";
 constexpr const char *kDockId = "distroav_multichannel_bridge_v030";
 constexpr const char *kProgramSourceId = "ndi_multichannel_bridge_program_audio";
 constexpr const char *kMicSourceId = "ndi_multichannel_bridge_mic_audio";
-constexpr const char *kVersion = "0.3.1-alpha";
+constexpr const char *kVersion = "0.5.0-alpha1";
+constexpr const char *kGovernorVersion = "1.2";
+constexpr const char *kSenderCoreVersion = "2.0";
 constexpr const char *kDefaultProgramName = "MCB Desktop / Game";
 constexpr const char *kDefaultMicName = "MCB Microphone";
+
+const char *governor_phase_name(mcb::AVGovernorPhase phase)
+{
+	switch (phase) {
+	case mcb::AVGovernorPhase::Bypassed: return "BYPASSED";
+	case mcb::AVGovernorPhase::WarmingUp: return "WARMING UP";
+	case mcb::AVGovernorPhase::Locked: return "LOCKED";
+	case mcb::AVGovernorPhase::Holding: return "HOLDING";
+	case mcb::AVGovernorPhase::Relocking: return "RELOCKING";
+	}
+	return "UNKNOWN";
+}
+
+const char *governor_reason_name(mcb::AVGovernorReason reason)
+{
+	switch (reason) {
+	case mcb::AVGovernorReason::None: return "none";
+	case mcb::AVGovernorReason::Startup: return "startup";
+	case mcb::AVGovernorReason::VideoStall: return "video stall";
+	case mcb::AVGovernorReason::AudioDiscontinuity: return "audio timestamp jump";
+	case mcb::AVGovernorReason::VideoDiscontinuity: return "video timestamp jump";
+	case mcb::AVGovernorReason::AudioNonMonotonic: return "audio timestamp repeated/backward";
+	case mcb::AVGovernorReason::VideoNonMonotonic: return "video timestamp repeated/backward";
+	case mcb::AVGovernorReason::SkewExceeded: return "A/V deviation exceeded";
+	case mcb::AVGovernorReason::PlayoutDepthExceeded: return "shared playout depth left safe range";
+	case mcb::AVGovernorReason::SourceReconfigured: return "source timing changed";
+	case mcb::AVGovernorReason::ManualReset: return "manual reset";
+	}
+	return "unknown";
+}
 
 std::atomic_int g_role_cache{-1};
 std::atomic_bool g_sender_enabled{false};
@@ -55,12 +97,22 @@ std::atomic_uint32_t g_sender_track_b{6};
 std::atomic_uint64_t g_sender_paired{0};
 std::atomic_uint64_t g_sender_discarded{0};
 std::atomic_uint64_t g_sender_fallback{0};
+std::atomic_uint64_t g_sender_discontinuities{0};
+std::atomic_uint64_t g_sender_video_discontinuities{0};
+std::atomic_uint64_t g_sender_reanchors{0};
+std::atomic_uint64_t g_sender_oversized{0};
+std::atomic_uint64_t g_sender_contention{0};
+std::atomic_uint64_t g_sender_epoch{1};
 std::atomic_int64_t g_sender_last_delta_ns{0};
 std::atomic_uint32_t g_sender_queue_a{0};
 std::atomic_uint32_t g_sender_queue_b{0};
 std::atomic<float> g_sender_peak_a{0.0f};
 std::atomic<float> g_sender_peak_b{0.0f};
 std::atomic_uint64_t g_sender_last_audio_ns{0};
+std::atomic_uint64_t g_sender_reanchor_generation{1};
+std::atomic_uint64_t g_sender_counter_reset_generation{1};
+std::atomic_uint64_t g_sender_last_video_timestamp_ns{0};
+std::atomic_bool g_ui_monitoring{false};
 
 config_t *bridge_config()
 {
@@ -79,6 +131,19 @@ void ensure_defaults()
 	config_set_default_string(config, kSection, "ProgramProxyName", kDefaultProgramName);
 	config_set_default_string(config, kSection, "MicProxyName", kDefaultMicName);
 	config_set_default_bool(config, kSection, "SuppressOriginal", true);
+	config_set_default_bool(config, kSection, "GovernorEnabled", true);
+	config_set_default_bool(config, kSection, "GovernorAutoConfigure", true);
+	config_set_default_int(config, kSection, "GovernorMaxSkewMs", 120);
+	config_set_default_int(config, kSection, "GovernorVideoStallMs", 120);
+	config_set_default_int(config, kSection, "GovernorPlayoutDelayMs", 120);
+	config_set_default_bool(config, kSection, "GovernorDriftCorrection", true);
+	config_set_default_int(config, kSection, "GovernorMaxVideoCorrectionMs", 40);
+	config_set_default_int(config, kSection, "GovernorCorrectionSlewPpm", 1000);
+	config_set_default_int(config, kSection, "GovernorRelockPairs", 12);
+	config_set_default_int(config, kSection, "GovernorBaselineWindowMs", 1000);
+	config_set_default_int(config, kSection, "GovernorDriftWindowMs", 30000);
+	config_set_default_int(config, kSection, "GovernorDriftMinimumMs", 10000);
+	config_set_default_int(config, kSection, "GovernorDriftDeadbandPpm", 8);
 }
 
 void save_config()
@@ -190,6 +255,7 @@ public:
 			last_error_.clear();
 		}
 		reset_stats();
+		refresh_source_configuration();
 		attached_.store(true, std::memory_order_release);
 		obs_log(LOG_INFO, "[multichannel-bridge] Receiver attached to raw DistroAV source '%s'", name.c_str());
 		return true;
@@ -207,6 +273,7 @@ public:
 		if (old)
 			obs_source_release(old);
 		attached_.store(false, std::memory_order_release);
+		reset_governor(false);
 	}
 
 	void set_suppress_original(bool suppress)
@@ -214,14 +281,77 @@ public:
 		suppress_original_.store(suppress, std::memory_order_release);
 	}
 
-	bool route(obs_source_t *origin, const obs_source_audio *audio, int channel_count)
+	void configure_governor(bool enabled, int max_deviation_ms, int video_stall_ms, int playout_delay_ms,
+		bool drift_correction, int max_video_correction_ms, int correction_slew_ppm, int relock_pairs,
+		int baseline_window_ms, int drift_window_ms, int drift_minimum_ms, int drift_deadband_ppm)
+	{
+		governor_.configure(enabled, max_deviation_ms, video_stall_ms, playout_delay_ms, drift_correction,
+			max_video_correction_ms, correction_slew_ppm, relock_pairs, baseline_window_ms,
+			drift_window_ms, drift_minimum_ms, drift_deadband_ppm);
+	}
+
+	bool apply_recommended_source_settings()
+	{
+		obs_source_t *source = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (input_)
+				source = obs_source_get_ref(input_);
+		}
+		if (!source)
+			return false;
+
+		obs_data_t *settings = obs_source_get_settings(source);
+		if (!settings) {
+			obs_source_release(source);
+			return false;
+		}
+		obs_data_set_bool(settings, "ndi_framesync", false);
+		obs_data_set_int(settings, "ndi_sync", 2);
+		obs_data_set_bool(settings, "ndi_audio", true);
+		obs_source_update(source, settings);
+		obs_data_release(settings);
+		obs_source_release(source);
+		governor_.set_source_configured(true);
+		governor_.reset(false);
+		obs_log(LOG_INFO,
+			"[multichannel-bridge] A/V Governor applied recommended source timing: Frame Sync off, Source Timecode on");
+		return true;
+	}
+
+	bool refresh_source_configuration()
+	{
+		obs_source_t *source = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (input_)
+				source = obs_source_get_ref(input_);
+		}
+		if (!source) {
+			governor_.set_source_configured(false);
+			return false;
+		}
+		obs_data_t *settings = obs_source_get_settings(source);
+		const bool configured = settings && !obs_data_get_bool(settings, "ndi_framesync") &&
+					obs_data_get_int(settings, "ndi_sync") == 2 && obs_data_get_bool(settings, "ndi_audio");
+		if (settings)
+			obs_data_release(settings);
+		obs_source_release(source);
+		governor_.set_source_configured(configured);
+		return configured;
+	}
+
+	bool route(obs_source_t *origin, const obs_source_audio *audio, int channel_count,
+		int64_t ndi_timestamp_100ns, int64_t ndi_timecode_100ns)
 	{
 		if (!origin || !audio || audio->frames == 0)
 			return false;
 
 		std::array<obs_source_t *, 2> outputs{};
 		{
-			std::lock_guard<std::mutex> lock(mutex_);
+			std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+			if (!lock.owns_lock())
+				return false;
 			if (!input_ || input_ != origin)
 				return false;
 			for (size_t pair = 0; pair < outputs.size(); ++pair) {
@@ -230,10 +360,25 @@ public:
 			}
 		}
 
+		const bool split_active = outputs[0] && outputs[1] && obs_source_active(outputs[0]) && obs_source_active(outputs[1]);
+		const uint64_t now_ns = os_gettime_ns();
 		channels_.store(std::max(channel_count, 0), std::memory_order_relaxed);
 		packets_.fetch_add(1, std::memory_order_relaxed);
-		last_packet_ns_.store(os_gettime_ns(), std::memory_order_relaxed);
+		last_packet_ns_.store(now_ns, std::memory_order_relaxed);
 
+		mcb::AVGovernorDecision audio_decision{true, audio->timestamp};
+		if (split_active)
+			audio_decision = governor_.process_audio(audio->timestamp, now_ns, ndi_timestamp_100ns, ndi_timecode_100ns);
+		if (!audio_decision.accept) {
+			for (auto *output : outputs) {
+				if (output)
+					obs_source_release(output);
+			}
+			return true;
+		}
+
+		const bool apply_gain = audio->format == AUDIO_FORMAT_FLOAT_PLANAR &&
+			(audio_decision.audio_gain_start != 1.0f || audio_decision.audio_gain_end != 1.0f);
 		for (int pair = 0; pair < 2; ++pair) {
 			const int first = pair * 2;
 			const uint8_t *left = first < channel_count ? audio->data[first] : nullptr;
@@ -249,9 +394,21 @@ public:
 				left = right;
 			if (!right)
 				right = left;
+			if (apply_gain && audio->frames <= mcb::SenderSyncCore::kMaxFrames) {
+				auto &left_scratch = fade_scratch_[static_cast<size_t>(first)];
+				auto &right_scratch = fade_scratch_[static_cast<size_t>(first + 1)];
+				apply_gain_ramp(reinterpret_cast<const float *>(left), left_scratch, audio->frames,
+					audio_decision.audio_gain_start, audio_decision.audio_gain_end);
+				apply_gain_ramp(reinterpret_cast<const float *>(right), right_scratch, audio->frames,
+					audio_decision.audio_gain_start, audio_decision.audio_gain_end);
+				left = reinterpret_cast<const uint8_t *>(left_scratch.data());
+				right = reinterpret_cast<const uint8_t *>(right_scratch.data());
+			}
 
-			peaks_[static_cast<size_t>(pair)].store(calculate_peak(left, right, audio->frames),
-								  std::memory_order_relaxed);
+			const float peak = mcb_ui_monitoring_enabled()
+				? calculate_peak(left, right, audio->frames)
+				: 0.0f;
+			peaks_[static_cast<size_t>(pair)].store(peak, std::memory_order_relaxed);
 			if (outputs[static_cast<size_t>(pair)]) {
 				obs_source_audio output{};
 				output.data[0] = const_cast<uint8_t *>(left);
@@ -260,18 +417,45 @@ public:
 				output.samples_per_sec = audio->samples_per_sec;
 				output.speakers = SPEAKERS_STEREO;
 				output.format = audio->format;
-				output.timestamp = audio->timestamp;
+				output.timestamp = audio_decision.output_timestamp_ns;
 				obs_source_output_audio(outputs[static_cast<size_t>(pair)], &output);
 				obs_source_release(outputs[static_cast<size_t>(pair)]);
 			}
 		}
 
-		const bool active = outputs_active();
-		const bool suppress = suppress_original_.load(std::memory_order_acquire) && active && channel_count >= 4;
+		const bool suppress = suppress_original_.load(std::memory_order_acquire) && split_active && channel_count >= 4;
 		if (suppress)
 			suppressed_.fetch_add(1, std::memory_order_relaxed);
 		return suppress;
 	}
+
+	bool route_video(obs_source_t *origin, obs_source_frame *video,
+		int64_t ndi_timestamp_100ns, int64_t ndi_timecode_100ns)
+	{
+		if (!origin || !video)
+			return true;
+		bool selected = false;
+		bool split_active = false;
+		{
+			std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+			if (!lock.owns_lock())
+				return true;
+			selected = input_ && input_ == origin;
+			split_active = proxies_[0] && proxies_[1] && obs_source_active(proxies_[0]) &&
+				       obs_source_active(proxies_[1]);
+		}
+		if (!selected || !split_active)
+			return true;
+		const auto decision = governor_.process_video(video->timestamp, os_gettime_ns(), ndi_timestamp_100ns, ndi_timecode_100ns);
+		if (decision.accept)
+			video->timestamp = decision.output_timestamp_ns;
+		return decision.accept;
+	}
+
+	mcb::AVGovernorSnapshot governor_snapshot() const { return governor_.snapshot(); }
+	std::string governor_flight_recorder_csv() const { return governor_.flight_recorder_csv(); }
+
+	void reset_governor(bool reset_counters) { governor_.reset(reset_counters); }
 
 	bool attached() const
 	{
@@ -323,9 +507,22 @@ public:
 		peaks_[0].store(0.0f, std::memory_order_relaxed);
 		peaks_[1].store(0.0f, std::memory_order_relaxed);
 		last_packet_ns_.store(0, std::memory_order_relaxed);
+		reset_governor(true);
 	}
 
 private:
+	static void apply_gain_ramp(const float *input,
+		std::array<float, mcb::SenderSyncCore::kMaxFrames> &scratch, uint32_t frames,
+		float start_gain, float end_gain)
+	{
+		if (!input || frames == 0)
+			return;
+		const float denominator = frames > 1 ? static_cast<float>(frames - 1) : 1.0f;
+		const float step = (end_gain - start_gain) / denominator;
+		for (uint32_t i = 0; i < frames; ++i)
+			scratch[i] = input[i] * (start_gain + step * static_cast<float>(i));
+	}
+
 	static float calculate_peak(const uint8_t *left, const uint8_t *right, uint32_t frames)
 	{
 		if ((!left && !right) || frames == 0)
@@ -357,6 +554,8 @@ private:
 	std::atomic_int channels_{0};
 	std::array<std::atomic<float>, 2> peaks_{};
 	std::atomic_uint64_t last_packet_ns_{0};
+	std::array<std::array<float, mcb::SenderSyncCore::kMaxFrames>, 4> fade_scratch_{};
+	mcb::AVGovernor governor_;
 };
 
 const char *program_source_name(void *) { return "Multichannel Bridge - Desktop / Game Audio"; }
@@ -526,6 +725,18 @@ public:
 		}
 		sender_form->addRow("Desktop/game level:", sender_program_meter_);
 		sender_form->addRow("Mic level:", sender_mic_meter_);
+		auto *sender_actions = new QWidget(sender_box_);
+		auto *sender_actions_layout = new QHBoxLayout(sender_actions);
+		sender_actions_layout->setContentsMargins(0, 0, 0, 0);
+		reanchor_sender_ = new QPushButton("Re-anchor sync", sender_actions);
+		restart_sender_ = new QPushButton("Restart Bridge", sender_actions);
+		reanchor_sender_->setToolTip(
+			"Flush the fixed sender audio queues and begin a fresh timing epoch without recreating NDI.");
+		restart_sender_->setToolTip(
+			"Stop and recreate only the Multichannel Bridge DistroAV Main Output with the same settings.");
+		sender_actions_layout->addWidget(reanchor_sender_);
+		sender_actions_layout->addWidget(restart_sender_);
+		sender_form->addRow("Quick recovery:", sender_actions);
 		layout->addWidget(sender_box_);
 
 		receiver_box_ = new QGroupBox("2. Stream PC receiver", body);
@@ -540,6 +751,97 @@ public:
 		source_row_layout->addWidget(refresh_);
 		source_row_layout->addWidget(open_source_);
 		receiver_form->addRow("DistroAV NDI video source:", source_row);
+
+		governor_box_ = new QGroupBox(
+			QString("A/V Governor %1 - shared timeline protection").arg(kGovernorVersion), receiver_box_);
+		governor_box_->setCheckable(true);
+		auto *governor_form = new QFormLayout(governor_box_);
+		auto_configure_ = new QCheckBox(
+			"Automatically disable NDI Frame Sync and use Source Timecode (recommended)", governor_box_);
+		playout_delay_ms_ = new QSpinBox(governor_box_);
+		playout_delay_ms_->setRange(40, 500);
+		playout_delay_ms_->setSuffix(" ms");
+		playout_delay_ms_->setToolTip(
+			"Adds the same fixed timestamp delay to audio and video so OBS can absorb brief arrival jitter before playout.");
+		max_skew_ms_ = new QSpinBox(governor_box_);
+		max_skew_ms_->setRange(40, 500);
+		max_skew_ms_->setSuffix(" ms");
+		max_skew_ms_->setToolTip(
+			"Hard safety limit. If A/V movement exceeds this, both paths pause and re-lock together.");
+		video_stall_ms_ = new QSpinBox(governor_box_);
+		video_stall_ms_->setRange(60, 1000);
+		video_stall_ms_->setSuffix(" ms");
+		video_stall_ms_->setToolTip(
+			"If video stops arriving for this long, audio is held before it can run ahead.");
+		drift_correction_ = new QCheckBox(
+			"Gently pace video timestamps to follow verified gradual audio-clock drift", governor_box_);
+		max_video_correction_ms_ = new QSpinBox(governor_box_);
+		max_video_correction_ms_->setRange(0, 120);
+		max_video_correction_ms_->setSuffix(" ms");
+		max_video_correction_ms_->setToolTip(
+			"Maximum temporary video timestamp correction. Audio samples are never resampled or cut.");
+		correction_slew_ppm_ = new QSpinBox(governor_box_);
+		correction_slew_ppm_->setRange(50, 10000);
+		correction_slew_ppm_->setSuffix(" ppm");
+		correction_slew_ppm_->setToolTip(
+			"Maximum speed at which video timing may move toward the measured drift. 1000 ppm equals 1 ms per second.");
+		relock_pairs_ = new QSpinBox(governor_box_);
+		relock_pairs_->setRange(3, 60);
+		relock_pairs_->setSuffix(" pairs");
+		relock_pairs_->setToolTip(
+			"Minimum number of sane audio/video observations required during the baseline-learning window.");
+		baseline_window_ms_ = new QSpinBox(governor_box_);
+		baseline_window_ms_->setRange(250, 5000);
+		baseline_window_ms_->setSuffix(" ms");
+		baseline_window_ms_->setToolTip(
+			"How long the governor learns a robust median baseline before releasing either path.");
+		drift_window_ms_ = new QSpinBox(governor_box_);
+		drift_window_ms_->setRange(5000, 120000);
+		drift_window_ms_->setSuffix(" ms");
+		drift_window_ms_->setToolTip(
+			"History used to distinguish real clock drift from short-term network jitter.");
+		drift_minimum_ms_ = new QSpinBox(governor_box_);
+		drift_minimum_ms_->setRange(2000, 120000);
+		drift_minimum_ms_->setSuffix(" ms");
+		drift_minimum_ms_->setToolTip(
+			"A drift direction must persist for at least this long before video timing is adjusted.");
+		drift_deadband_ppm_ = new QSpinBox(governor_box_);
+		drift_deadband_ppm_->setRange(1, 250);
+		drift_deadband_ppm_->setSuffix(" ppm");
+		drift_deadband_ppm_->setToolTip(
+			"Ignore smaller estimated clock differences so normal jitter cannot trigger correction.");
+		governor_help_ = new QLabel(
+			"Recommended mode maps both paths onto one future timeline in OBS's native async queues, learns a one-second median baseline, "
+			"ignores short jitter, adjusts only video after confirmed drift, and re-locks both paths together after a fault.", governor_box_);
+		governor_help_->setWordWrap(true);
+		governor_status_ = new QLabel(governor_box_);
+		governor_status_->setWordWrap(true);
+		recommended_governor_ = new QPushButton("Restore recommended settings", governor_box_);
+		recommended_governor_->setToolTip("Restore conservative settings suitable for a single two-PC NDI source.");
+		advanced_governor_ = new QCheckBox("Show advanced timing controls", governor_box_);
+		advanced_governor_panel_ = new QWidget(governor_box_);
+		auto *advanced_form = new QFormLayout(advanced_governor_panel_);
+		advanced_form->setContentsMargins(0, 0, 0, 0);
+		advanced_form->addRow("Hard A/V deviation limit:", max_skew_ms_);
+		advanced_form->addRow("Video-stall hold threshold:", video_stall_ms_);
+		advanced_form->addRow("Maximum video correction:", max_video_correction_ms_);
+		advanced_form->addRow("Video correction slew:", correction_slew_ppm_);
+		advanced_form->addRow("Minimum baseline observations:", relock_pairs_);
+		advanced_form->addRow("Baseline learning time:", baseline_window_ms_);
+		advanced_form->addRow("Drift analysis window:", drift_window_ms_);
+		advanced_form->addRow("Minimum confirmed drift time:", drift_minimum_ms_);
+		advanced_form->addRow("Drift deadband:", drift_deadband_ppm_);
+		advanced_governor_panel_->setVisible(false);
+		governor_form->addRow(auto_configure_);
+		governor_form->addRow("Shared playout delay:", playout_delay_ms_);
+		governor_form->addRow(drift_correction_);
+		governor_form->addRow(advanced_governor_);
+		governor_form->addRow(advanced_governor_panel_);
+		governor_form->addRow(governor_help_);
+		governor_form->addRow(recommended_governor_);
+		governor_form->addRow("Governor status:", governor_status_);
+		receiver_form->addRow(governor_box_);
+
 		program_name_ = new QLineEdit(receiver_box_);
 		mic_name_ = new QLineEdit(receiver_box_);
 		receiver_form->addRow("Desktop/game mixer source name:", program_name_);
@@ -567,9 +869,15 @@ public:
 		apply_ = new QPushButton("Apply role and settings", body);
 		reset_stats_ = new QPushButton("Reset counters", body);
 		copy_diagnostics_ = new QPushButton("Copy diagnostics", body);
+		copy_flight_recorder_ = new QPushButton("Copy A/V flight recorder", body);
+		copy_flight_recorder_->setToolTip("Copies a bounded CSV timeline including raw NDI timestamp/timecode and OBS output timing.");
+		export_diagnostics_ = new QPushButton("Export diagnostics", body);
+		export_diagnostics_->setToolTip("Writes a timestamped diagnostics folder containing status and the A/V flight recorder.");
 		actions->addWidget(apply_, 1);
 		actions->addWidget(reset_stats_);
 		actions->addWidget(copy_diagnostics_);
+		actions->addWidget(copy_flight_recorder_);
+		actions->addWidget(export_diagnostics_);
 		layout->addLayout(actions);
 
 		checklist_ = new QLabel(body);
@@ -588,6 +896,25 @@ public:
 		connect(receiver_radio_, &QRadioButton::toggled, this, [this] { role_changed(); });
 		connect(confirm_, &QCheckBox::toggled, this, [this] { apply_->setEnabled(confirm_->isChecked()); });
 		connect(refresh_, &QPushButton::clicked, this, [this] { refresh_sources(); });
+		connect(advanced_governor_, &QCheckBox::toggled, this, [this](bool visible) {
+			advanced_governor_panel_->setVisible(visible);
+		});
+		connect(recommended_governor_, &QPushButton::clicked, this, [this] {
+			governor_box_->setChecked(true);
+			auto_configure_->setChecked(true);
+			playout_delay_ms_->setValue(120);
+			max_skew_ms_->setValue(120);
+			video_stall_ms_->setValue(120);
+			drift_correction_->setChecked(true);
+			max_video_correction_ms_->setValue(40);
+			correction_slew_ppm_->setValue(1000);
+			relock_pairs_->setValue(12);
+			baseline_window_ms_->setValue(1000);
+			drift_window_ms_->setValue(30000);
+			drift_minimum_ms_->setValue(10000);
+			drift_deadband_ppm_->setValue(8);
+			checklist_->setText("Recommended A/V Governor settings restored. Click Apply role and settings.");
+		});
 		connect(open_source_, &QPushButton::clicked, this, [this] {
 			obs_source_t *source = obs_get_source_by_name(receiver_source_->currentText().toUtf8().constData());
 			if (source) {
@@ -595,20 +922,29 @@ public:
 				obs_source_release(source);
 			}
 		});
+		connect(reanchor_sender_, &QPushButton::clicked, this, [this] { reanchor_sender(); });
+		connect(restart_sender_, &QPushButton::clicked, this, [this] { restart_sender(); });
 		connect(apply_, &QPushButton::clicked, this, [this] { apply_settings(false); });
 		connect(create_receiver_, &QPushButton::clicked, this, [this] { apply_settings(true); });
 		connect(reset_stats_, &QPushButton::clicked, this, [this] {
 			mcb_sender_status_reset_counters();
-			ReceiverRouter::instance().reset_stats();
+			if (mcb_is_receiver())
+				ReceiverRouter::instance().reset_stats();
 			update_status();
 		});
 		connect(copy_diagnostics_, &QPushButton::clicked, this, [this] {
 			QApplication::clipboard()->setText(diagnostics());
 		});
+		connect(copy_flight_recorder_, &QPushButton::clicked, this, [this] {
+			const std::string csv = ReceiverRouter::instance().governor_flight_recorder_csv();
+			QApplication::clipboard()->setText(QString::fromStdString(csv));
+			checklist_->setText("Recent A/V flight recorder copied as CSV.");
+		});
+		connect(export_diagnostics_, &QPushButton::clicked, this, [this] { export_diagnostics(); });
 
 		timer_ = new QTimer(this);
+		timer_->setInterval(1000);
 		connect(timer_, &QTimer::timeout, this, [this] { update_status(); });
-		timer_->start(500);
 	}
 
 	void frontend_finished_loading()
@@ -632,7 +968,60 @@ public:
 			receiver_source_->setCurrentIndex(index);
 	}
 
+	void quick_restart_sender() { restart_sender(); }
+
 private:
+	void reanchor_sender()
+	{
+		if (!mcb_is_sender()) {
+			checklist_->setText("Re-anchor is available only on the Gaming PC / Sender role.");
+			return;
+		}
+		mcb_request_sender_reanchor();
+		checklist_->setText("Sender timing re-anchor requested. It will apply on the next audio callback.");
+	}
+
+	void restart_sender()
+	{
+		if (!mcb_is_sender()) {
+			checklist_->setText("Restart Bridge is available only on the Gaming PC / Sender role.");
+			return;
+		}
+		const uint64_t now_ns = os_gettime_ns();
+		if (last_restart_ns_ && now_ns >= last_restart_ns_ &&
+			now_ns - last_restart_ns_ < 2000000000ULL) {
+			checklist_->setText("Restart Bridge is cooling down. Wait two seconds before trying again.");
+			return;
+		}
+		last_restart_ns_ = now_ns;
+		restart_sender_->setEnabled(false);
+		reanchor_sender_->setEnabled(false);
+		mcb_request_sender_reanchor();
+		main_output_deinit();
+		main_output_init();
+		restart_sender_->setEnabled(true);
+		reanchor_sender_->setEnabled(true);
+		checklist_->setText("Multichannel NDI sender restarted with the existing track mapping.");
+		update_status();
+	}
+
+	void showEvent(QShowEvent *event) override
+	{
+		QWidget::showEvent(event);
+		g_ui_monitoring.store(true, std::memory_order_release);
+		update_status();
+		if (timer_)
+			timer_->start();
+	}
+
+	void hideEvent(QHideEvent *event) override
+	{
+		if (timer_)
+			timer_->stop();
+		g_ui_monitoring.store(false, std::memory_order_release);
+		QWidget::hideEvent(event);
+	}
+
 	void load_ui()
 	{
 		const MCBRole role = mcb_role();
@@ -645,6 +1034,29 @@ private:
 		mic_name_->setText(QString::fromUtf8(config_string("MicProxyName", kDefaultMicName)));
 		auto *config = bridge_config();
 		suppress_original_->setChecked(config ? config_get_bool(config, kSection, "SuppressOriginal") : true);
+		governor_box_->setChecked(config ? config_get_bool(config, kSection, "GovernorEnabled") : true);
+		auto_configure_->setChecked(config ? config_get_bool(config, kSection, "GovernorAutoConfigure") : true);
+		max_skew_ms_->setValue(config ? static_cast<int>(config_get_int(config, kSection, "GovernorMaxSkewMs")) : 120);
+		video_stall_ms_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorVideoStallMs")) : 120);
+		playout_delay_ms_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorPlayoutDelayMs")) : 120);
+		drift_correction_->setChecked(
+			config ? config_get_bool(config, kSection, "GovernorDriftCorrection") : true);
+		max_video_correction_ms_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorMaxVideoCorrectionMs")) : 40);
+		correction_slew_ppm_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorCorrectionSlewPpm")) : 1000);
+		relock_pairs_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorRelockPairs")) : 12);
+		baseline_window_ms_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorBaselineWindowMs")) : 1000);
+		drift_window_ms_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftWindowMs")) : 30000);
+		drift_minimum_ms_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftMinimumMs")) : 10000);
+		drift_deadband_ppm_->setValue(
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftDeadbandPpm")) : 8);
 		apply_->setEnabled(confirm_->isChecked());
 	}
 
@@ -664,8 +1076,8 @@ private:
 				"Track A and mic to Track B. Enable DistroAV Main Output. Applying here rebuilds Main Output.");
 		} else if (receiver_radio_->isChecked()) {
 			checklist_->setText(
-				"<b>Receiver checklist:</b> Add one normal DistroAV NDI Source for the gaming-PC feed, "
-				"select it above, then create the two split mixer sources.");
+				"<b>Receiver checklist:</b> Add one normal DistroAV NDI Source, select it above, leave the "
+				"A/V Governor on, then create the two split mixer sources. Recommended timing settings are applied automatically.");
 		} else {
 			checklist_->setText("Select and confirm a role before using the bridge.");
 		}
@@ -682,6 +1094,7 @@ private:
 			return;
 		}
 
+		const MCBRole previous_role = mcb_role();
 		auto *config = bridge_config();
 		if (!config)
 			return;
@@ -693,11 +1106,25 @@ private:
 		config_set_string(config, kSection, "ProgramProxyName", program_name_->text().toUtf8().constData());
 		config_set_string(config, kSection, "MicProxyName", mic_name_->text().toUtf8().constData());
 		config_set_bool(config, kSection, "SuppressOriginal", suppress_original_->isChecked());
+		config_set_bool(config, kSection, "GovernorEnabled", governor_box_->isChecked());
+		config_set_bool(config, kSection, "GovernorAutoConfigure", auto_configure_->isChecked());
+		config_set_int(config, kSection, "GovernorMaxSkewMs", max_skew_ms_->value());
+		config_set_int(config, kSection, "GovernorVideoStallMs", video_stall_ms_->value());
+		config_set_int(config, kSection, "GovernorPlayoutDelayMs", playout_delay_ms_->value());
+		config_set_bool(config, kSection, "GovernorDriftCorrection", drift_correction_->isChecked());
+		config_set_int(config, kSection, "GovernorMaxVideoCorrectionMs", max_video_correction_ms_->value());
+		config_set_int(config, kSection, "GovernorCorrectionSlewPpm", correction_slew_ppm_->value());
+		config_set_int(config, kSection, "GovernorRelockPairs", relock_pairs_->value());
+		config_set_int(config, kSection, "GovernorBaselineWindowMs", baseline_window_ms_->value());
+		config_set_int(config, kSection, "GovernorDriftWindowMs", drift_window_ms_->value());
+		config_set_int(config, kSection, "GovernorDriftMinimumMs", drift_minimum_ms_->value());
+		config_set_int(config, kSection, "GovernorDriftDeadbandPpm", drift_deadband_ppm_->value());
 		save_config();
 		set_role_cache(new_role);
 
 		if (new_role == MCBRole::Sender) {
-			ReceiverRouter::instance().detach();
+			if (previous_role == MCBRole::Receiver)
+				ReceiverRouter::instance().detach();
 			main_output_init();
 			checklist_->setText("Sender role applied. DistroAV Main Output was rebuilt with the selected tracks.");
 		} else {
@@ -716,6 +1143,15 @@ private:
 			return;
 		}
 		ReceiverRouter::instance().set_suppress_original(suppress_original_->isChecked());
+		ReceiverRouter::instance().configure_governor(
+			governor_box_->isChecked(), max_skew_ms_->value(), video_stall_ms_->value(),
+			playout_delay_ms_->value(), drift_correction_->isChecked(), max_video_correction_ms_->value(),
+			correction_slew_ppm_->value(), relock_pairs_->value(), baseline_window_ms_->value(),
+			drift_window_ms_->value(), drift_minimum_ms_->value(), drift_deadband_ppm_->value());
+		if (governor_box_->isChecked() && auto_configure_->isChecked())
+			ReceiverRouter::instance().apply_recommended_source_settings();
+		else
+			ReceiverRouter::instance().refresh_source_configuration();
 		if (create_sources) {
 			const bool program_ok = add_proxy_to_current_scene(
 				kProgramSourceId, program_name_->text().toUtf8().constData());
@@ -728,45 +1164,121 @@ private:
 		}
 	}
 
+	void export_diagnostics()
+	{
+		const QString parent = QFileDialog::getExistingDirectory(this, "Choose diagnostics location");
+		if (parent.isEmpty())
+			return;
+		const QString folder_name = QString("Multichannel-Bridge-Diagnostics-%1")
+			.arg(QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss"));
+		QDir parent_dir(parent);
+		if (!parent_dir.mkpath(folder_name)) {
+			QMessageBox::warning(this, "Diagnostics export", "Could not create the diagnostics folder.");
+			return;
+		}
+		QDir output_dir(parent_dir.filePath(folder_name));
+		auto write_text = [&output_dir](const QString &name, const QByteArray &data) {
+			QFile file(output_dir.filePath(name));
+			if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+				return false;
+			return file.write(data) == static_cast<qint64>(data.size());
+		};
+		const QByteArray status = diagnostics().toUtf8();
+		const QByteArray recorder = QByteArray::fromStdString(
+			ReceiverRouter::instance().governor_flight_recorder_csv());
+		const QByteArray notes(
+			"This bundle contains OBS-side bridge status and a bounded A/V timing history.\n"
+			"The CSV includes raw NDI timestamp/timecode values, converted OBS timestamps,\n"
+			"playout depth, drift estimates, and recovery actions.\n");
+		const bool ok = write_text("bridge-status.txt", status) &&
+			write_text("av-governor-flight-recorder.csv", recorder) &&
+			write_text("README.txt", notes);
+		if (!ok) {
+			QMessageBox::warning(this, "Diagnostics export", "One or more diagnostics files could not be written.");
+			return;
+		}
+		checklist_->setText(QString("Diagnostics exported to %1").arg(output_dir.absolutePath()));
+		QMessageBox::information(this, "Diagnostics export", output_dir.absolutePath());
+	}
+
 	QString diagnostics() const
 	{
 		const auto sender = mcb_sender_status_snapshot();
 		const auto &router = ReceiverRouter::instance();
 		const uint64_t now = os_gettime_ns();
 		const double sender_age = sender.last_audio_monotonic_ns && now >= sender.last_audio_monotonic_ns
-					  ? static_cast<double>(now - sender.last_audio_monotonic_ns) / 1e6
-					  : -1.0;
+			? static_cast<double>(now - sender.last_audio_monotonic_ns) / 1e6
+			: -1.0;
 		const double receiver_age = router.last_packet_ns() && now >= router.last_packet_ns()
-					    ? static_cast<double>(now - router.last_packet_ns()) / 1e6
-					    : -1.0;
-		return QString(
-			       "Multichannel Bridge for DistroAV %1\nRole: %2\nOBS audio rate: %3 Hz\n"
-			       "Sender active: %4\nTracks: %5 / %6\nPaired: %7\nDiscarded: %8\nSilence fallback: %9\n"
-			       "Last timestamp delta: %10 ms\nQueues: %11 / %12\nSender audio age: %13 ms\n"
-			       "Receiver attached: %14\nSplit outputs ready: %15\nSplit outputs active: %16\nDetected channels: %17\nPackets: %18\n"
-			       "Suppressed original packets: %19\nReceiver packet age: %20 ms\nMissing program: %21\nMissing mic: %22")
+			? static_cast<double>(now - router.last_packet_ns()) / 1e6
+			: -1.0;
+		const auto governor = router.governor_snapshot();
+		QString text;
+		text += QString("Multichannel Bridge for DistroAV %1\nRole: %2\nOBS audio rate: %3 Hz\n")
 			.arg(kVersion)
 			.arg(mcb_is_sender() ? "Gaming PC / Sender" : mcb_is_receiver() ? "Stream PC / Receiver" : "Unconfigured")
-			.arg(obs_get_audio() ? audio_output_get_sample_rate(obs_get_audio()) : 0)
-			.arg(sender.active ? "yes" : "no")
-			.arg(sender.track_a)
-			.arg(sender.track_b)
+			.arg(obs_get_audio() ? audio_output_get_sample_rate(obs_get_audio()) : 0);
+		text += QString("Sender Sync Core %1\nSender active: %2\nTracks: %3 / %4\nPaired: %5\nDiscarded: %6\nSilence fallback: %7\n")
+			.arg(kSenderCoreVersion)
+			.arg(sender.active ? "yes" : "no").arg(sender.track_a).arg(sender.track_b)
 			.arg(static_cast<qulonglong>(sender.paired_blocks))
 			.arg(static_cast<qulonglong>(sender.discarded_blocks))
-			.arg(static_cast<qulonglong>(sender.silence_fallback_blocks))
+			.arg(static_cast<qulonglong>(sender.silence_fallback_blocks));
+		text += QString("Discontinuities: %1\nRe-anchors: %2\nOversized blocks: %3\nCallback contention drops: %4\nSender epoch: %5\n")
+			.arg(static_cast<qulonglong>(sender.discontinuities))
+			.arg(static_cast<qulonglong>(sender.reanchors))
+			.arg(static_cast<qulonglong>(sender.oversized_blocks))
+			.arg(static_cast<qulonglong>(sender.contention_drops))
+			.arg(static_cast<qulonglong>(sender.epoch));
+		text += QString("Last timestamp delta: %1 ms\nQueues: %2 / %3\nSender audio age: %4 ms\n")
 			.arg(static_cast<double>(sender.last_timestamp_delta_ns) / 1e6, 0, 'f', 3)
-			.arg(sender.queue_depth_a)
-			.arg(sender.queue_depth_b)
-			.arg(sender_age, 0, 'f', 1)
-			.arg(router.attached() ? "yes" : "no")
-			.arg(router.outputs_ready() ? "yes" : "no")
-			.arg(router.outputs_active() ? "yes" : "no")
-			.arg(router.channels())
-			.arg(static_cast<qulonglong>(router.packets()))
-			.arg(static_cast<qulonglong>(router.suppressed()))
-			.arg(receiver_age, 0, 'f', 1)
-			.arg(static_cast<qulonglong>(router.missing_program()))
+			.arg(sender.queue_depth_a).arg(sender.queue_depth_b).arg(sender_age, 0, 'f', 1);
+		text += QString("Receiver attached: %1\nSplit outputs ready: %2\nSplit outputs active: %3\nDetected channels: %4\n")
+			.arg(router.attached() ? "yes" : "no").arg(router.outputs_ready() ? "yes" : "no")
+			.arg(router.outputs_active() ? "yes" : "no").arg(router.channels());
+		text += QString("Packets: %1\nSuppressed original packets: %2\nReceiver packet age: %3 ms\nMissing program: %4\nMissing mic: %5\n")
+			.arg(static_cast<qulonglong>(router.packets())).arg(static_cast<qulonglong>(router.suppressed()))
+			.arg(receiver_age, 0, 'f', 1).arg(static_cast<qulonglong>(router.missing_program()))
 			.arg(static_cast<qulonglong>(router.missing_mic()));
+		text += QString("A/V Governor %1: %2\nPhase: %3\nReason: %4\nSource timing configured: %5\n")
+			.arg(kGovernorVersion).arg(governor.enabled ? "enabled" : "disabled")
+			.arg(governor_phase_name(governor.phase)).arg(governor_reason_name(governor.reason))
+			.arg(governor.source_configured ? "yes" : "no");
+		text += QString("Playout delay: %1 ms\nPlayout depth audio/video: %2 / %3 ms\nEstimated video interval: %4 ms\n")
+			.arg(static_cast<double>(governor.playout_delay_ns) / 1e6, 0, 'f', 1)
+			.arg(static_cast<double>(governor.audio_playout_depth_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<double>(governor.video_playout_depth_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<double>(governor.estimated_video_interval_ns) / 1e6, 0, 'f', 3);
+		text += QString("Raw/filtered A/V skew: %1 / %2 ms\nLearned baseline: %3 ms (%4 samples over %5 ms)\nBaseline deviation: %6 ms\n")
+			.arg(static_cast<double>(governor.raw_av_skew_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<double>(governor.av_skew_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<double>(governor.baseline_skew_ns) / 1e6, 0, 'f', 3)
+			.arg(governor.baseline_samples)
+			.arg(static_cast<double>(governor.baseline_window_ns) / 1e6, 0, 'f', 0)
+			.arg(static_cast<double>(governor.baseline_deviation_ns) / 1e6, 0, 'f', 3);
+		text += QString("Estimated drift: %1 ppm (%2% confidence, %3 samples)\nVideo correction: %4 ms (target %5 ms)\nEpoch rebase: %6 ms\n")
+			.arg(static_cast<qlonglong>(governor.drift_ppm)).arg(governor.drift_confidence).arg(governor.drift_samples)
+			.arg(static_cast<double>(governor.video_correction_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<double>(governor.target_video_correction_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<double>(governor.epoch_rebase_ns) / 1e6, 0, 'f', 3);
+		text += QString("Blocked audio/video: %1 / %2\nFade-out/fade-in packets: %3 / %4\nMonotonic clamps: %5\n")
+			.arg(static_cast<qulonglong>(governor.blocked_audio)).arg(static_cast<qulonglong>(governor.blocked_video))
+			.arg(static_cast<qulonglong>(governor.fade_out_packets)).arg(static_cast<qulonglong>(governor.fade_in_packets))
+			.arg(static_cast<qulonglong>(governor.monotonic_clamps));
+		text += QString("Raw NDI audio timestamp/timecode: %1 / %2 (100 ns)\nRaw NDI video timestamp/timecode: %3 / %4 (100 ns)\n")
+			.arg(static_cast<qlonglong>(governor.last_audio_ndi_timestamp_100ns))
+			.arg(static_cast<qlonglong>(governor.last_audio_ndi_timecode_100ns))
+			.arg(static_cast<qlonglong>(governor.last_video_ndi_timestamp_100ns))
+			.arg(static_cast<qlonglong>(governor.last_video_ndi_timecode_100ns));
+		text += QString("Discontinuities: %1\nLock acquisitions: %2\nAtomic recoveries: %3\nEpoch: %4\n")
+			.arg(static_cast<qulonglong>(governor.discontinuities))
+			.arg(static_cast<qulonglong>(governor.lock_acquisitions))
+			.arg(static_cast<qulonglong>(governor.atomic_recoveries))
+			.arg(static_cast<qulonglong>(governor.epoch));
+		text += QString("Re-lock progress: %1 / %2\nCorrection updates: %3\nFlight recorder events: %4")
+			.arg(governor.relock_progress).arg(governor.relock_required)
+			.arg(static_cast<qulonglong>(governor.correction_updates)).arg(governor.recorder_events);
+		return text;
 	}
 
 	void update_status()
@@ -785,15 +1297,22 @@ private:
 		const QString phase_note = std::fabs(delta_ms) >= 15.0 && std::fabs(delta_ms) <= 30.0
 					   ? " (normal OBS two-mix phase)"
 					   : "";
+		const bool sender_healthy = status.active && status.discarded_blocks == 0 &&
+			status.silence_fallback_blocks == 0 && status.oversized_blocks == 0 &&
+			status.contention_drops == 0;
 		sender_status_->setText(
-			QString("%1 · Track %2 → NDI 1-2 · Track %3 → NDI 3-4 · paired %4 · discarded %5 · "
-				"fallback %6 · delta %7 ms%8 · queues %9/%10 · audio age %11 ms%12")
-				.arg(status.active ? "ACTIVE" : "not active")
+			QString("%1 · Sync Core %2 · Track %3 → NDI 1-2 · Track %4 → NDI 3-4 · "
+				"paired %5 · discards/fallback %6/%7 · re-anchors %8 · epoch %9 · "
+				"delta %10 ms%11 · queues %12/%13 · audio age %14 ms%15")
+				.arg(sender_healthy ? "PROTECTED" : status.active ? "ACTIVE - check counters" : "not active")
+				.arg(kSenderCoreVersion)
 				.arg(status.track_a)
 				.arg(status.track_b)
 				.arg(static_cast<qulonglong>(status.paired_blocks))
 				.arg(static_cast<qulonglong>(status.discarded_blocks))
 				.arg(static_cast<qulonglong>(status.silence_fallback_blocks))
+				.arg(static_cast<qulonglong>(status.reanchors))
+				.arg(static_cast<qulonglong>(status.epoch))
 				.arg(delta_ms, 0, 'f', 3)
 				.arg(phase_note)
 				.arg(status.queue_depth_a)
@@ -802,6 +1321,8 @@ private:
 				.arg(rate_warning));
 		sender_program_meter_->setValue(meter_value(status.peak_a));
 		sender_mic_meter_->setValue(meter_value(status.peak_b));
+		if (!mcb_is_receiver())
+			return;
 
 		auto &router = ReceiverRouter::instance();
 		const double receiver_age = router.last_packet_ns() && now >= router.last_packet_ns()
@@ -828,6 +1349,42 @@ private:
 				.arg(static_cast<qulonglong>(router.missing_mic())));
 		program_meter_->setValue(meter_value(router.peak(0)));
 		mic_meter_->setValue(meter_value(router.peak(1)));
+
+		const auto governor = router.governor_snapshot();
+		QString governor_state = QString::fromUtf8(governor_phase_name(governor.phase));
+		if (governor.video_stalled)
+			governor_state = "VIDEO STALL — holding both paths";
+		const QString config_warning = governor.enabled && !governor.source_configured
+			? " · source settings not recommended"
+			: "";
+		const QString recovery_note = governor.phase == mcb::AVGovernorPhase::Holding ||
+			governor.phase == mcb::AVGovernorPhase::Relocking
+			? QString(" · %1 · re-lock %2/%3")
+				.arg(governor_reason_name(governor.reason))
+				.arg(governor.relock_progress).arg(governor.relock_required)
+			: "";
+		governor_status_->setText(
+			QString("%1 · delay/depth A/V %2/%3/%4 ms · skew raw/filtered/base %5/%6/%7 ms · "
+				"deviation %8 ms · drift %9 ppm (%10%) · video correction %11→%12 ms · "
+				"blocked A/V %13/%14 · recoveries %15 · fades %16/%17%18%19")
+				.arg(governor_state)
+				.arg(static_cast<double>(governor.playout_delay_ns) / 1e6, 0, 'f', 0)
+				.arg(static_cast<double>(governor.audio_playout_depth_ns) / 1e6, 0, 'f', 1)
+				.arg(static_cast<double>(governor.video_playout_depth_ns) / 1e6, 0, 'f', 1)
+				.arg(static_cast<double>(governor.raw_av_skew_ns) / 1e6, 0, 'f', 2)
+				.arg(static_cast<double>(governor.av_skew_ns) / 1e6, 0, 'f', 2)
+				.arg(static_cast<double>(governor.baseline_skew_ns) / 1e6, 0, 'f', 2)
+				.arg(static_cast<double>(governor.baseline_deviation_ns) / 1e6, 0, 'f', 2)
+				.arg(static_cast<qlonglong>(governor.drift_ppm)).arg(governor.drift_confidence)
+				.arg(static_cast<double>(governor.video_correction_ns) / 1e6, 0, 'f', 2)
+				.arg(static_cast<double>(governor.target_video_correction_ns) / 1e6, 0, 'f', 2)
+				.arg(static_cast<qulonglong>(governor.blocked_audio))
+				.arg(static_cast<qulonglong>(governor.blocked_video))
+				.arg(static_cast<qulonglong>(governor.atomic_recoveries))
+				.arg(static_cast<qulonglong>(governor.fade_out_packets))
+				.arg(static_cast<qulonglong>(governor.fade_in_packets))
+				.arg(recovery_note).arg(config_warning));
+
 	}
 
 	QRadioButton *sender_radio_ = nullptr;
@@ -840,9 +1397,29 @@ private:
 	QLabel *sender_status_ = nullptr;
 	QProgressBar *sender_program_meter_ = nullptr;
 	QProgressBar *sender_mic_meter_ = nullptr;
+	QPushButton *reanchor_sender_ = nullptr;
+	QPushButton *restart_sender_ = nullptr;
 	QComboBox *receiver_source_ = nullptr;
 	QPushButton *refresh_ = nullptr;
 	QPushButton *open_source_ = nullptr;
+	QGroupBox *governor_box_ = nullptr;
+	QCheckBox *auto_configure_ = nullptr;
+	QCheckBox *advanced_governor_ = nullptr;
+	QWidget *advanced_governor_panel_ = nullptr;
+	QSpinBox *playout_delay_ms_ = nullptr;
+	QSpinBox *max_skew_ms_ = nullptr;
+	QSpinBox *video_stall_ms_ = nullptr;
+	QCheckBox *drift_correction_ = nullptr;
+	QSpinBox *max_video_correction_ms_ = nullptr;
+	QSpinBox *correction_slew_ppm_ = nullptr;
+	QSpinBox *relock_pairs_ = nullptr;
+	QSpinBox *baseline_window_ms_ = nullptr;
+	QSpinBox *drift_window_ms_ = nullptr;
+	QSpinBox *drift_minimum_ms_ = nullptr;
+	QSpinBox *drift_deadband_ppm_ = nullptr;
+	QLabel *governor_help_ = nullptr;
+	QLabel *governor_status_ = nullptr;
+	QPushButton *recommended_governor_ = nullptr;
 	QLineEdit *program_name_ = nullptr;
 	QLineEdit *mic_name_ = nullptr;
 	QCheckBox *suppress_original_ = nullptr;
@@ -853,11 +1430,15 @@ private:
 	QPushButton *apply_ = nullptr;
 	QPushButton *reset_stats_ = nullptr;
 	QPushButton *copy_diagnostics_ = nullptr;
+	QPushButton *copy_flight_recorder_ = nullptr;
+	QPushButton *export_diagnostics_ = nullptr;
 	QLabel *checklist_ = nullptr;
 	QTimer *timer_ = nullptr;
+	uint64_t last_restart_ns_ = 0;
 };
 
 BridgeDock *g_dock = nullptr;
+QAction *g_restart_action = nullptr;
 
 void frontend_event(enum obs_frontend_event event, void *)
 {
@@ -869,7 +1450,8 @@ void frontend_event(enum obs_frontend_event event, void *)
 			if (g_dock)
 				g_dock->frontend_finished_loading();
 		}, Qt::QueuedConnection);
-	} else if (event == OBS_FRONTEND_EVENT_EXIT || event == OBS_FRONTEND_EVENT_PROFILE_CHANGING) {
+	} else if ((event == OBS_FRONTEND_EVENT_EXIT || event == OBS_FRONTEND_EVENT_PROFILE_CHANGING) &&
+		mcb_is_receiver()) {
 		ReceiverRouter::instance().detach();
 	}
 }
@@ -914,17 +1496,29 @@ void mcb_init(QWidget *main_window)
 		return;
 	}
 	obs_frontend_add_event_callback(frontend_event, nullptr);
+	g_restart_action = static_cast<QAction *>(
+		obs_frontend_add_tools_menu_qaction("Restart Multichannel NDI Sender"));
+	if (g_restart_action) {
+		g_restart_action->setToolTip("Recreate only the Multichannel Bridge DistroAV Main Output.");
+		QObject::connect(g_restart_action, &QAction::triggered, g_dock, [] {
+			if (g_dock)
+				g_dock->quick_restart_sender();
+		});
+	}
 	obs_log(LOG_INFO, "[multichannel-bridge] Dock initialized (%s)", kVersion);
 }
 
 void mcb_shutdown()
 {
 	obs_frontend_remove_event_callback(frontend_event, nullptr);
-	ReceiverRouter::instance().detach();
+	if (mcb_is_receiver())
+		ReceiverRouter::instance().detach();
 	if (g_dock) {
 		obs_frontend_remove_dock(kDockId);
 		g_dock = nullptr;
 	}
+	g_restart_action = nullptr;
+	g_ui_monitoring.store(false, std::memory_order_release);
 }
 
 MCBSenderStatus mcb_sender_status_snapshot()
@@ -937,6 +1531,12 @@ MCBSenderStatus mcb_sender_status_snapshot()
 	status.paired_blocks = g_sender_paired.load(std::memory_order_relaxed);
 	status.discarded_blocks = g_sender_discarded.load(std::memory_order_relaxed);
 	status.silence_fallback_blocks = g_sender_fallback.load(std::memory_order_relaxed);
+	status.discontinuities = g_sender_discontinuities.load(std::memory_order_relaxed) +
+		g_sender_video_discontinuities.load(std::memory_order_relaxed);
+	status.reanchors = g_sender_reanchors.load(std::memory_order_relaxed);
+	status.oversized_blocks = g_sender_oversized.load(std::memory_order_relaxed);
+	status.contention_drops = g_sender_contention.load(std::memory_order_relaxed);
+	status.epoch = g_sender_epoch.load(std::memory_order_relaxed);
 	status.last_timestamp_delta_ns = g_sender_last_delta_ns.load(std::memory_order_relaxed);
 	status.queue_depth_a = g_sender_queue_a.load(std::memory_order_relaxed);
 	status.queue_depth_b = g_sender_queue_b.load(std::memory_order_relaxed);
@@ -952,6 +1552,7 @@ void mcb_sender_status_started(size_t track_a_zero_based, size_t track_b_zero_ba
 	g_sender_active.store(true, std::memory_order_relaxed);
 	g_sender_track_a.store(static_cast<uint32_t>(track_a_zero_based + 1), std::memory_order_relaxed);
 	g_sender_track_b.store(static_cast<uint32_t>(track_b_zero_based + 1), std::memory_order_relaxed);
+	g_sender_last_video_timestamp_ns.store(0, std::memory_order_relaxed);
 	mcb_sender_status_reset_counters();
 }
 
@@ -964,42 +1565,44 @@ void mcb_sender_status_stopped()
 	g_sender_peak_b.store(0.0f, std::memory_order_relaxed);
 }
 
-void mcb_sender_status_paired(int64_t timestamp_delta_ns, size_t queue_a, size_t queue_b)
+void mcb_sender_status_sync(uint64_t paired, uint64_t discarded, uint64_t fallback,
+	uint64_t discontinuities, uint64_t reanchors, uint64_t oversized,
+	uint64_t contention_drops, uint64_t epoch, int64_t timestamp_delta_ns,
+	uint32_t queue_a, uint32_t queue_b, float peak_a, float peak_b)
 {
-	g_sender_paired.fetch_add(1, std::memory_order_relaxed);
+	g_sender_paired.store(paired, std::memory_order_relaxed);
+	g_sender_discarded.store(discarded, std::memory_order_relaxed);
+	g_sender_fallback.store(fallback, std::memory_order_relaxed);
+	g_sender_discontinuities.store(discontinuities, std::memory_order_relaxed);
+	g_sender_reanchors.store(reanchors, std::memory_order_relaxed);
+	g_sender_oversized.store(oversized, std::memory_order_relaxed);
+	g_sender_contention.store(contention_drops, std::memory_order_relaxed);
+	g_sender_epoch.store(epoch, std::memory_order_relaxed);
 	g_sender_last_delta_ns.store(timestamp_delta_ns, std::memory_order_relaxed);
-	g_sender_queue_a.store(static_cast<uint32_t>(queue_a), std::memory_order_relaxed);
-	g_sender_queue_b.store(static_cast<uint32_t>(queue_b), std::memory_order_relaxed);
-	g_sender_last_audio_ns.store(os_gettime_ns(), std::memory_order_relaxed);
-}
-
-void mcb_sender_status_discarded(int64_t timestamp_delta_ns, size_t queue_a, size_t queue_b)
-{
-	g_sender_discarded.fetch_add(1, std::memory_order_relaxed);
-	g_sender_last_delta_ns.store(timestamp_delta_ns, std::memory_order_relaxed);
-	g_sender_queue_a.store(static_cast<uint32_t>(queue_a), std::memory_order_relaxed);
-	g_sender_queue_b.store(static_cast<uint32_t>(queue_b), std::memory_order_relaxed);
-}
-
-void mcb_sender_status_silence_fallback(size_t queue_a, size_t queue_b)
-{
-	g_sender_fallback.fetch_add(1, std::memory_order_relaxed);
-	g_sender_queue_a.store(static_cast<uint32_t>(queue_a), std::memory_order_relaxed);
-	g_sender_queue_b.store(static_cast<uint32_t>(queue_b), std::memory_order_relaxed);
-	g_sender_last_audio_ns.store(os_gettime_ns(), std::memory_order_relaxed);
-}
-
-void mcb_sender_status_levels(float peak_a, float peak_b)
-{
+	g_sender_queue_a.store(queue_a, std::memory_order_relaxed);
+	g_sender_queue_b.store(queue_b, std::memory_order_relaxed);
 	g_sender_peak_a.store(std::clamp(peak_a, 0.0f, 1.0f), std::memory_order_relaxed);
 	g_sender_peak_b.store(std::clamp(peak_b, 0.0f, 1.0f), std::memory_order_relaxed);
+	g_sender_last_audio_ns.store(os_gettime_ns(), std::memory_order_relaxed);
+}
+
+void mcb_sender_status_contention_drop()
+{
+	g_sender_contention.fetch_add(1, std::memory_order_relaxed);
 }
 
 void mcb_sender_status_reset_counters()
 {
+	g_sender_counter_reset_generation.fetch_add(1, std::memory_order_acq_rel);
 	g_sender_paired.store(0, std::memory_order_relaxed);
 	g_sender_discarded.store(0, std::memory_order_relaxed);
 	g_sender_fallback.store(0, std::memory_order_relaxed);
+	g_sender_discontinuities.store(0, std::memory_order_relaxed);
+	g_sender_video_discontinuities.store(0, std::memory_order_relaxed);
+	g_sender_reanchors.store(0, std::memory_order_relaxed);
+	g_sender_oversized.store(0, std::memory_order_relaxed);
+	g_sender_contention.store(0, std::memory_order_relaxed);
+	g_sender_epoch.store(1, std::memory_order_relaxed);
 	g_sender_last_delta_ns.store(0, std::memory_order_relaxed);
 	g_sender_queue_a.store(0, std::memory_order_relaxed);
 	g_sender_queue_b.store(0, std::memory_order_relaxed);
@@ -1008,9 +1611,55 @@ void mcb_sender_status_reset_counters()
 	g_sender_last_audio_ns.store(0, std::memory_order_relaxed);
 }
 
-bool mcb_receiver_route_audio(obs_source_t *origin, const obs_source_audio *audio, int channel_count)
+uint64_t mcb_sender_counter_reset_generation()
+{
+	return g_sender_counter_reset_generation.load(std::memory_order_acquire);
+}
+
+void mcb_request_sender_reanchor()
+{
+	g_sender_reanchor_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+uint64_t mcb_sender_reanchor_generation()
+{
+	return g_sender_reanchor_generation.load(std::memory_order_acquire);
+}
+
+void mcb_sender_observe_video(uint64_t timestamp_ns)
+{
+	if (!timestamp_ns)
+		return;
+	const uint64_t previous = g_sender_last_video_timestamp_ns.exchange(
+		timestamp_ns, std::memory_order_acq_rel);
+	if (!previous)
+		return;
+	constexpr uint64_t maximum_continuous_gap_ns = 2000000000ULL;
+	if (timestamp_ns <= previous || timestamp_ns - previous > maximum_continuous_gap_ns) {
+		g_sender_video_discontinuities.fetch_add(1, std::memory_order_relaxed);
+		mcb_request_sender_reanchor();
+	}
+}
+
+bool mcb_ui_monitoring_enabled()
+{
+	return g_ui_monitoring.load(std::memory_order_acquire);
+}
+
+bool mcb_receiver_route_audio(obs_source_t *origin, const obs_source_audio *audio, int channel_count,
+	int64_t ndi_timestamp_100ns, int64_t ndi_timecode_100ns)
 {
 	if (!mcb_is_receiver())
 		return false;
-	return ReceiverRouter::instance().route(origin, audio, channel_count);
+	return ReceiverRouter::instance().route(origin, audio, channel_count,
+		ndi_timestamp_100ns, ndi_timecode_100ns);
+}
+
+bool mcb_receiver_route_video(obs_source_t *origin, obs_source_frame *video,
+	int64_t ndi_timestamp_100ns, int64_t ndi_timecode_100ns)
+{
+	if (!mcb_is_receiver())
+		return true;
+	return ReceiverRouter::instance().route_video(origin, video,
+		ndi_timestamp_100ns, ndi_timecode_100ns);
 }

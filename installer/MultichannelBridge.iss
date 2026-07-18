@@ -1,8 +1,8 @@
 #ifndef AppVersion
-  #define AppVersion "0.3.1-alpha"
+  #define AppVersion "0.5.0-alpha1"
 #endif
 #ifndef AppNumericVersion
-  #define AppNumericVersion "0.3.1.0"
+  #define AppNumericVersion "0.5.0.0"
 #endif
 #ifndef SourceRoot
   #define SourceRoot "..\obs-install"
@@ -12,7 +12,7 @@
 #endif
 
 #define AppName "Multichannel Bridge for DistroAV"
-#define RepoURL "https://github.com/businessdrewski-hash/Multi-Channel-Bridge-For-NDI-and-OBS-Studio"
+#define RepoURL "https://github.com/businessdrewski-hash/Drewski-Multichannel-Bridge"
 
 [Setup]
 AppId={{E6286704-A58A-4D4B-86F7-CF31DA7BB6B9}
@@ -45,7 +45,7 @@ LicenseFile={#SourceRoot}\DISTROAV-GPL-LICENSE.txt
 InfoAfterFile={#SourceRoot}\README.md
 VersionInfoVersion={#AppNumericVersion}
 VersionInfoCompany=Andrew Carriker and contributors
-VersionInfoDescription=Installer for Multichannel Bridge for DistroAV
+VersionInfoDescription=Multichannel audio bridge and upstream A/V timing guard for DistroAV
 VersionInfoProductName={#AppName}
 VersionInfoProductVersion={#AppNumericVersion}
 
@@ -57,6 +57,9 @@ Source: "{#SourceRoot}\Uninstall-MultichannelBridge.ps1"; DestDir: "{app}"; Flag
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\INSTALL-BOTH-PCS.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\AV-GOVERNOR.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\UPSTREAM-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#SourceRoot}\Multichannel-Bridge-DistroAV-6.2.1.patch"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceRoot}\ROADMAP.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceRoot}\LICENSE-NOTICE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\DISTROAV-GPL-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion

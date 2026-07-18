@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""Apply Multichannel Bridge for DistroAV v0.3.1-alpha to DistroAV 6.2.1.
+"""Apply Multichannel Bridge for DistroAV v0.5.0-alpha1 to DistroAV 6.2.1.
 
 The resulting custom DistroAV package is installed on BOTH computers. The OBS
 Dock selects Gaming PC / Sender or Stream PC / Receiver.
 
-Sender mode captures two OBS stereo mixes, aligns them with bounded FIFO
-queues while tolerating OBS's normal one-block timestamp phase between raw
-multitrack callbacks, and transmits one four-channel NDI audio frame beside
-DistroAV's existing video frame.
+Sender mode captures two OBS stereo mixes, aligns them with a preallocated
+fixed-capacity synchronizer while tolerating OBS's normal one-block timestamp
+phase between raw multitrack callbacks, and transmits one four-channel NDI
+audio frame beside DistroAV's existing video frame. The bridge packing path
+performs no allocation and adds no callback mutex wait.
 
 Receiver mode intercepts DistroAV's raw planar NDI audio before OBS remixes it,
 then exposes channels 1-2 and 3-4 as two independent stereo OBS mixer sources.
+
+A/V Governor 1.2 gives the sender audio and video explicit timecodes derived from
+the same OBS monotonic clock. On the receiver it adds one shared playout delay, gently paces video timestamps
+for verified gradual drift, and atomically holds/re-locks both paths after stalls
+or timestamp discontinuities.
 """
 from __future__ import annotations
 
@@ -20,7 +26,7 @@ import re
 import shutil
 from pathlib import Path
 
-PATCH_MARKER = "Multichannel Bridge for DistroAV v0.3.1-alpha"
+PATCH_MARKER = "Multichannel Bridge for DistroAV v0.5.0-alpha1"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -45,7 +51,9 @@ def patch_cmake(path: Path) -> None:
     text = regex_once(
         text,
         r"^(?P<indent>[ \t]*)src/main-output\.h[ \t]*$",
-        r"\g<0>\n\g<indent>src/multichannel-bridge.cpp\n\g<indent>src/multichannel-bridge.h",
+        r"\g<0>\n\g<indent>src/av-governor.cpp\n\g<indent>src/av-governor.h"
+        r"\n\g<indent>src/sender-sync-core.cpp\n\g<indent>src/sender-sync-core.h"
+        r"\n\g<indent>src/multichannel-bridge.cpp\n\g<indent>src/multichannel-bridge.h",
         "CMake source list",
     )
     path.write_text(text, encoding="utf-8", newline="\n")
@@ -158,9 +166,13 @@ def patch_main_output(path: Path) -> None:
 
 def patch_ndi_source(path: Path) -> None:
     text = path.read_text(encoding="utf-8")
-    if "mcb_receiver_route_audio" in text:
+    audio_patched = "mcb_receiver_route_audio" in text
+    video_patched = "mcb_receiver_route_video" in text
+    if audio_patched and video_patched:
         print(f"Already patched: {path}")
         return
+    if audio_patched or video_patched:
+        raise RuntimeError(f"Partially patched NDI source detected: {path}")
     text = replace_once(
         text,
         '#include "plugin-main.h"\n',
@@ -172,11 +184,20 @@ def patch_ndi_source(path: Path) -> None:
         "\t// Multichannel Bridge for DistroAV receiver hook: split raw planar NDI channels\n"
         "\t// before OBS remixes the source to the profile speaker layout.\n"
         "\tconst bool suppress_original_audio =\n"
-        "\t\tmcb_receiver_route_audio(obs_source, obs_audio_frame, channelCount);\n"
+        "\t\tmcb_receiver_route_audio(obs_source, obs_audio_frame, channelCount,\n"
+        "\t\t\tndi_audio_frame->timestamp, ndi_audio_frame->timecode);\n"
         "\tif (!suppress_original_audio)\n"
         "\t\tobs_source_output_audio(obs_source, obs_audio_frame);\n"
     )
     text = replace_once(text, old, new, "raw receiver audio hook")
+    old_video = "\tobs_source_output_video(obs_source, obs_video_frame);\n"
+    new_video = (
+        "\t// A/V Governor: map audio and video onto one future OBS playout timeline.\n"
+        "\tif (mcb_receiver_route_video(obs_source, obs_video_frame,\n"
+        "\t\t\tndi_video_frame->timestamp, ndi_video_frame->timecode))\n"
+        "\t\tobs_source_output_video(obs_source, obs_video_frame);\n"
+    )
+    text = replace_once(text, old_video, new_video, "raw receiver video governor hook")
     path.write_text(text, encoding="utf-8", newline="\n")
     print(f"Patched: {path}")
 
@@ -191,34 +212,22 @@ def patch_ndi_output(path: Path) -> None:
         '#include <util/threading.h>\n#include <chrono>\n',
         '#include <util/threading.h>\n#include <chrono>\n\n'
         '#include "multichannel-bridge.h"\n'
-        '#include <algorithm>\n#include <array>\n#include <cmath>\n#include <cstdlib>\n#include <cstring>\n'
-        '#include <deque>\n#include <mutex>\n#include <vector>\n',
+        '#include "sender-sync-core.h"\n'
+        '#include <algorithm>\n#include <atomic>\n#include <cstdint>\n',
         "NDI output includes",
     )
 
     state_types = r'''
-// Multichannel Bridge for DistroAV v0.3.1-alpha
-// A bounded FIFO is required because OBS uses one shared raw-output frame
-// counter for all selected mixers. Adjacent mixer callbacks therefore normally
-// carry timestamps one 1024-frame block apart even when their samples represent
-// the same OBS mix interval. Accept one block of phase; discard only when a
-// queue falls farther behind than that.
-struct multichannel_stereo_block {
-	uint64_t timestamp = 0;
-	uint32_t frames = 0;
-	float peak = 0.0f;
-	std::array<std::vector<float>, 2> channels;
-};
-
+// Multichannel Bridge for DistroAV v0.5.0-alpha1. SenderSyncCore owns all
+// sample storage up front. The atomic flag is a non-blocking safety guard: OBS
+// normally serializes selected-mixer callbacks, but an unexpected concurrent
+// callback is dropped instead of waiting on the real-time audio thread.
 struct multichannel_audio_state {
-	std::mutex mutex;
-	std::deque<multichannel_stereo_block> pending[2];
-	std::vector<float> packed;
-	std::vector<float> silence;
-	float latest_peak[2] = {0.0f, 0.0f};
-	uint64_t paired_blocks = 0;
-	uint64_t discarded_blocks = 0;
-	uint64_t fallback_blocks = 0;
+	mcb::SenderSyncCore core;
+	std::atomic_flag callback_busy = ATOMIC_FLAG_INIT;
+	uint64_t applied_reanchor_generation = 0;
+	uint64_t applied_counter_reset_generation = 0;
+	std::atomic_uint64_t contention_drops{0};
 };
 
 '''
@@ -256,12 +265,14 @@ struct multichannel_audio_state {
 \t\to->audio_samplerate = audio_output_get_sample_rate(audio);
 \t\tif (o->multichannel_audio) {
 \t\t\to->audio_channels = 4;
+\t\t\to->multichannel_state->core.configure(o->audio_samplerate);
+\t\t\to->multichannel_state->applied_reanchor_generation = mcb_sender_reanchor_generation();
+\t\t\to->multichannel_state->applied_counter_reset_generation = mcb_sender_counter_reset_generation();
 \t\t\taudio_convert_info conversion{};
 \t\t\tconversion.samples_per_sec = o->audio_samplerate;
 \t\t\tconversion.format = AUDIO_FORMAT_FLOAT_PLANAR;
 \t\t\tconversion.speakers = SPEAKERS_STEREO;
 \t\t\tobs_output_set_audio_conversion(o->output, &conversion);
-\t\t\tmcb_sender_status_started(o->multichannel_track_a, o->multichannel_track_b);
 \t\t\tobs_log(LOG_INFO,
 \t\t\t\t"[multichannel-bridge] Multichannel Main Output started: OBS Track %zu -> NDI 1-2, OBS Track %zu -> NDI 3-4",
 \t\t\t\to->multichannel_track_a + 1, o->multichannel_track_b + 1);
@@ -272,6 +283,14 @@ struct multichannel_audio_state {
 \t}
 '''
     text = replace_once(text, old_audio_start, new_audio_start, "audio start block")
+    text = replace_once(
+        text,
+        "		o->started = obs_output_begin_data_capture(o->output, flags);\n		if (o->started) {\n",
+        "		o->started = obs_output_begin_data_capture(o->output, flags);\n		if (o->started) {\n"
+        "			if (o->multichannel_audio)\n"
+        "				mcb_sender_status_started(o->multichannel_track_a, o->multichannel_track_b);\n",
+        "sender status activation",
+    )
 
     old_update = '''\to->uses_video = obs_data_get_bool(settings, "uses_video");
 \to->uses_audio = obs_data_get_bool(settings, "uses_audio");
@@ -295,10 +314,8 @@ struct multichannel_audio_state {
         "\t\tobs_output_end_data_capture(o->output);\n",
         "\t\tobs_output_end_data_capture(o->output);\n"
         "\t\tif (o->multichannel_audio)\n\t\t\tmcb_sender_status_stopped();\n"
-        "\t\tif (o->multichannel_state) {\n"
-        "\t\t\tstd::lock_guard<std::mutex> lock(o->multichannel_state->mutex);\n"
-        "\t\t\to->multichannel_state->pending[0].clear();\n"
-        "\t\t\to->multichannel_state->pending[1].clear();\n\t\t}\n",
+        "\t\tif (o->multichannel_state)\n"
+        "\t\t\to->multichannel_state->core.reset(false);\n",
         "stop cleanup",
     )
     text = replace_once(
@@ -310,38 +327,44 @@ struct multichannel_audio_state {
     )
 
     raw_audio2 = r'''
-static float multichannel_peak(const multichannel_stereo_block *block)
+class multichannel_callback_guard {
+public:
+	explicit multichannel_callback_guard(multichannel_audio_state *state) : state_(state)
+	{
+		acquired_ = state_ && !state_->callback_busy.test_and_set(std::memory_order_acquire);
+		if (state_ && !acquired_)
+			++state_->contention_drops;
+	}
+	~multichannel_callback_guard()
+	{
+		if (acquired_)
+			state_->callback_busy.clear(std::memory_order_release);
+	}
+	explicit operator bool() const { return acquired_; }
+private:
+	multichannel_audio_state *state_ = nullptr;
+	bool acquired_ = false;
+};
+
+static void multichannel_publish_status(multichannel_audio_state *state)
 {
-	return block ? block->peak : 0.0f;
+	const auto snapshot = state->core.snapshot();
+	mcb_sender_status_sync(snapshot.paired_blocks, snapshot.discarded_blocks,
+		snapshot.silence_fallback_blocks, snapshot.discontinuities,
+		snapshot.reanchors, snapshot.oversized_blocks,
+		state->contention_drops.load(std::memory_order_relaxed),
+		snapshot.epoch, snapshot.last_timestamp_delta_ns,
+		snapshot.queue_depth_a, snapshot.queue_depth_b,
+		snapshot.peak_a, snapshot.peak_b);
 }
 
-static void multichannel_send_block(ndi_output_t *o, const multichannel_stereo_block *track_a,
-	const multichannel_stereo_block *track_b)
+static void multichannel_send_output(ndi_output_t *o, const mcb::SenderSyncCore::Output &output)
 {
-	auto *state = o->multichannel_state;
-	const multichannel_stereo_block *reference = track_a ? track_a : track_b;
-	if (!state || !reference || reference->frames == 0)
-		return;
-	const size_t frames = reference->frames;
-	state->silence.assign(frames, 0.0f);
-	state->packed.resize(frames * 4);
-	for (size_t channel = 0; channel < 2; ++channel) {
-		const float *a = track_a ? track_a->channels[channel].data() : state->silence.data();
-		const float *b = track_b ? track_b->channels[channel].data() : state->silence.data();
-		std::memcpy(state->packed.data() + channel * frames, a, frames * sizeof(float));
-		std::memcpy(state->packed.data() + (channel + 2) * frames, b, frames * sizeof(float));
-	}
-
 	audio_data combined{};
-	combined.frames = (uint32_t)frames;
-	combined.timestamp = track_a && track_b ? std::max(track_a->timestamp, track_b->timestamp)
-						 : track_a ? track_a->timestamp : track_b->timestamp;
-	for (size_t channel = 0; channel < 4; ++channel)
-		combined.data[channel] = reinterpret_cast<uint8_t *>(state->packed.data() + channel * frames);
-
-	mcb_sender_status_levels(multichannel_peak(track_a), multichannel_peak(track_b));
-	// DistroAV's NDI send call is synchronous; packed storage remains stable while
-	// the state mutex is held by the caller.
+	combined.frames = output.frames;
+	combined.timestamp = output.timestamp_ns;
+	for (size_t channel = 0; channel < mcb::SenderSyncCore::kOutputChannels; ++channel)
+		combined.data[channel] = reinterpret_cast<uint8_t *>(const_cast<float *>(output.data[channel]));
 	ndi_output_rawaudio(o, &combined);
 }
 
@@ -375,90 +398,63 @@ void ndi_output_rawaudio2(void *data, size_t mix_idx, audio_data *frame)
 	else
 		return;
 
-	multichannel_stereo_block incoming;
-	incoming.timestamp = frame->timestamp;
-	incoming.frames = frame->frames;
-	for (size_t channel = 0; channel < 2; ++channel) {
-		incoming.channels[channel].resize(frame->frames);
-		const uint8_t *source = frame->data[channel] ? frame->data[channel] : frame->data[0];
-		if (source) {
-			std::memcpy(incoming.channels[channel].data(), source, frame->frames * sizeof(float));
-			const float *samples = reinterpret_cast<const float *>(source);
-			for (uint32_t i = 0; i < frame->frames; ++i)
-				incoming.peak = std::max(incoming.peak, std::fabs(samples[i]));
-		} else {
-			std::fill(incoming.channels[channel].begin(), incoming.channels[channel].end(), 0.0f);
-		}
-	}
-	incoming.peak = std::min(incoming.peak, 1.0f);
-
 	auto *state = o->multichannel_state;
-	std::lock_guard<std::mutex> lock(state->mutex);
-	state->latest_peak[slot] = incoming.peak;
-	mcb_sender_status_levels(state->latest_peak[0], state->latest_peak[1]);
-	state->pending[slot].push_back(std::move(incoming));
-
-	constexpr size_t max_queue_depth = 12;
-	if (state->pending[slot].size() > max_queue_depth) {
-		state->pending[slot].pop_front();
-		++state->discarded_blocks;
-		mcb_sender_status_discarded(0, state->pending[0].size(), state->pending[1].size());
+	multichannel_callback_guard guard(state);
+	if (!guard) {
+		mcb_sender_status_contention_drop();
+		return;
 	}
 
-	auto &queue_a = state->pending[0];
-	auto &queue_b = state->pending[1];
-	const uint64_t one_sample_ns = o->audio_samplerate ? 1000000000ULL / o->audio_samplerate : 20834ULL;
-
-	while (!queue_a.empty() && !queue_b.empty()) {
-		auto &a = queue_a.front();
-		auto &b = queue_b.front();
-		const int64_t delta = (int64_t)b.timestamp - (int64_t)a.timestamp;
-		const uint64_t absolute_delta = (uint64_t)std::llabs(delta);
-		const uint64_t block_duration_ns = o->audio_samplerate
-			? ((uint64_t)std::max(a.frames, b.frames) * 1000000000ULL) / o->audio_samplerate
-			: 21333333ULL;
-		// OBS increments one shared raw-output audio counter once for every selected
-		// mixer callback. With two mixers, corresponding blocks normally differ by
-		// exactly one block duration (21.333 ms at 48 kHz / 1024 frames).
-		const uint64_t timestamp_tolerance_ns =
-			block_duration_ns + std::max<uint64_t>(500000ULL, one_sample_ns * 8ULL);
-
-		if (a.frames == b.frames && absolute_delta <= timestamp_tolerance_ns) {
-			multichannel_send_block(o, &a, &b);
-			queue_a.pop_front();
-			queue_b.pop_front();
-			++state->paired_blocks;
-			mcb_sender_status_paired(delta, queue_a.size(), queue_b.size());
-			continue;
-		}
-
-		// More than one full block apart means one FIFO is genuinely stale.
-		// Discard only the older front and preserve the newer block for recovery.
-		if (a.timestamp <= b.timestamp)
-			queue_a.pop_front();
-		else
-			queue_b.pop_front();
-		++state->discarded_blocks;
-		mcb_sender_status_discarded(delta, queue_a.size(), queue_b.size());
+	const uint64_t requested_reanchor = mcb_sender_reanchor_generation();
+	if (requested_reanchor != state->applied_reanchor_generation) {
+		state->core.reanchor();
+		state->applied_reanchor_generation = requested_reanchor;
+	}
+	const uint64_t requested_counter_reset = mcb_sender_counter_reset_generation();
+	if (requested_counter_reset != state->applied_counter_reset_generation) {
+		state->core.reset(true);
+		state->contention_drops.store(0, std::memory_order_relaxed);
+		state->applied_counter_reset_generation = requested_counter_reset;
 	}
 
-	// Keep NDI audio alive if one selected OBS mix genuinely stops producing
-	// callbacks. Four queued blocks gives the other mix time to catch up first.
-	constexpr size_t fallback_depth = 4;
-	if (queue_a.size() >= fallback_depth && queue_b.empty()) {
-		multichannel_send_block(o, &queue_a.front(), nullptr);
-		queue_a.pop_front();
-		++state->fallback_blocks;
-		mcb_sender_status_silence_fallback(queue_a.size(), queue_b.size());
-	} else if (queue_b.size() >= fallback_depth && queue_a.empty()) {
-		multichannel_send_block(o, nullptr, &queue_b.front());
-		queue_b.pop_front();
-		++state->fallback_blocks;
-		mcb_sender_status_silence_fallback(queue_a.size(), queue_b.size());
+	const float *left = reinterpret_cast<const float *>(frame->data[0] ? frame->data[0] : frame->data[1]);
+	const float *right = reinterpret_cast<const float *>(frame->data[1] ? frame->data[1] : frame->data[0]);
+	if (!state->core.push(slot, frame->timestamp, frame->frames, left, right,
+		mcb_ui_monitoring_enabled())) {
+		multichannel_publish_status(state);
+		return;
 	}
+
+	mcb::SenderSyncCore::Output output;
+	bool sent = false;
+	while (state->core.pop_output(output)) {
+		multichannel_send_output(o, output);
+		sent = true;
+	}
+	if (sent || mcb_ui_monitoring_enabled())
+		multichannel_publish_status(state);
 }
 
 '''
+    text = replace_once(
+        text,
+        "\tvideo_frame.timecode = NDIlib_send_timecode_synthesize;\n",
+        "\tif (o->multichannel_audio)\n"
+        "\t\tmcb_sender_observe_video(frame->timestamp);\n"
+        "\tvideo_frame.timecode = (o->multichannel_audio && frame->timestamp)\n"
+        "\t\t? (int64_t)(frame->timestamp / 100ULL)\n"
+        "\t\t: NDIlib_send_timecode_synthesize;\n",
+        "shared OBS video timecode",
+    )
+    text = replace_once(
+        text,
+        "\taudio_frame.timecode = NDIlib_send_timecode_synthesize;\n",
+        "\taudio_frame.timecode = (o->multichannel_audio && frame->timestamp)\n"
+        "\t\t? (int64_t)(frame->timestamp / 100ULL)\n"
+        "\t\t: NDIlib_send_timecode_synthesize;\n",
+        "shared OBS audio timecode",
+    )
+
     text = replace_once(
         text,
         "obs_output_info create_ndi_output_info()\n",
@@ -482,7 +478,14 @@ void ndi_output_rawaudio2(void *data, size_t mix_idx, audio_data *frame)
 
 
 def copy_bridge_files(root: Path, bridge_dir: Path) -> None:
-    for name in ("multichannel-bridge.cpp", "multichannel-bridge.h"):
+    for name in (
+        "av-governor.cpp",
+        "av-governor.h",
+        "sender-sync-core.cpp",
+        "sender-sync-core.h",
+        "multichannel-bridge.cpp",
+        "multichannel-bridge.h",
+    ):
         source = bridge_dir / name
         if not source.exists():
             raise FileNotFoundError(source)
@@ -492,12 +495,16 @@ def copy_bridge_files(root: Path, bridge_dir: Path) -> None:
 
 def write_notice(root: Path) -> None:
     (root / "MULTICHANNEL-BRIDGE.md").write_text(
-        "# Multichannel Bridge for DistroAV v0.3.1-alpha\n\n"
+        "# Multichannel Bridge for DistroAV v0.5.0-alpha1\n\n"
         "Custom DistroAV 6.2.1 build. Install the same package on both PCs, then use "
         "Docks > Multichannel Bridge for DistroAV to select Gaming PC / Sender or Stream PC / Receiver.\n\n"
         "Sender defaults: OBS Track 5 -> NDI channels 1-2; OBS Track 6 -> channels 3-4.\n"
         "Receiver: one normal DistroAV NDI Source provides video while the bridge exposes the two stereo "
         "pairs as independent OBS audio-only sources.\n\n"
+        "Sender Sync Core 2.0 uses fixed preallocated audio storage, canonical mix-interval timestamps, "
+        "automatic discontinuity re-anchoring, and no blocking callback lock. A/V Governor 1.2 uses "
+        "explicit sender timecodes, one shared playout delay, bounded video pacing, "
+        "and atomic hold/re-lock recovery after stalls or timestamp jumps. It is optional and enabled by default.\n\n"
         "Experimental. Not affiliated with or endorsed by DistroAV. DistroAV remains GPL-2.0-or-later.\n",
         encoding="utf-8",
         newline="\n",
@@ -510,6 +517,10 @@ def verify(root: Path) -> None:
         for path in (
             "src/ndi-output.cpp",
             "src/ndi-source.cpp",
+            "src/av-governor.cpp",
+            "src/av-governor.h",
+            "src/sender-sync-core.cpp",
+            "src/sender-sync-core.h",
             "src/main-output.cpp",
             "src/plugin-main.cpp",
             "src/multichannel-bridge.cpp",
@@ -524,8 +535,21 @@ def verify(root: Path) -> None:
         "mcb_register_sources();",
         "mcb_init(main_window);",
         "obs_frontend_add_dock_by_id",
-        "mcb_receiver_route_audio(obs_source, obs_audio_frame, channelCount)",
-        "mcb_sender_status_paired",
+        "mcb_receiver_route_audio(obs_source, obs_audio_frame, channelCount,",
+        "mcb_receiver_route_video(obs_source, obs_video_frame,",
+        "frame->timestamp / 100ULL",
+        'kGovernorVersion = "1.2"',
+        "GovernorPlayoutDelayMs",
+        "governor_flight_recorder_csv",
+        "mcb_receiver_route_video",
+        "class AVGovernor",
+        "mcb_sender_status_sync",
+        "class SenderSyncCore",
+        "mcb_sender_reanchor_generation",
+        "mcb_sender_observe_video",
+        "mcb_sender_status_sync",
+        "src/sender-sync-core.cpp",
+        "src/av-governor.cpp",
         "src/multichannel-bridge.cpp",
         "Track A and Track B must be different",
     ]

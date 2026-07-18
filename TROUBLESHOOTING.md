@@ -1,17 +1,15 @@
 # Troubleshooting
 
-## Setup EXE fails or closes
+## Setup EXE fails
 
-Use the EXE installer rather than launching files from inside a ZIP. Close OBS and run setup as Administrator. Review:
+Close OBS and run setup as Administrator. Review:
 
 ```text
 C:\ProgramData\Multichannel Bridge for DistroAV\Installer\install-script.log
 C:\ProgramData\Multichannel Bridge for DistroAV\install.log
 ```
 
-The portable ZIP remains available for debugging.
-
-## The dock is missing
+## Dock is missing
 
 Search the OBS log for:
 
@@ -20,60 +18,93 @@ Search the OBS log for:
 [multichannel-bridge] Dock initialized
 ```
 
-The dock is under **Docks → Multichannel Bridge for DistroAV**. DistroAV still reports its upstream base version; the bridge log markers identify the modified build.
+The dock is under **Docks -> Multichannel Bridge for DistroAV**.
 
-## OBS says the old multichannel plugin is missing
+## Two DistroAV menus
 
-Version 0.3.1 is integrated into `distroav.dll`; it does not use `ndi-multichannel-bridge.dll`. Re-run the EXE installer with stale Plugin Manager cleanup enabled. It resets `modules.json` only when the exact legacy bridge ID is present and keeps a backup.
+OBS is loading more than one `distroav.dll`. Re-run setup or search Program Files, ProgramData, Roaming AppData, and Local AppData. Only one active copy should remain for the OBS installation being used.
 
-## Two DistroAV menus appear
+## Sender has video but no bridge audio
 
-OBS is loading DistroAV twice. The installer disables the common duplicate locations automatically. To inspect manually:
+- Select Gaming PC / Sender.
+- Use two different tracks.
+- Route sources to those tracks in Advanced Audio Properties.
+- Use 48 kHz on both PCs.
+- Enable DistroAV Main Output.
+- Confirm `Paired` rises.
 
-```powershell
-Get-ChildItem `
-  "C:\Program Files\obs-studio", `
-  "$env:ProgramData\obs-studio", `
-  "$env:APPDATA\obs-studio", `
-  "$env:LOCALAPPDATA\obs-studio" `
-  -Filter distroav.dll -Recurse -ErrorAction SilentlyContinue |
-Select-Object FullName,Length,LastWriteTime
+A sender callback delta near 21.333 ms at 48 kHz can be normal for the two OBS mixes.
+
+## Sender audio is stale, frozen, or suddenly offset
+
+Use the smallest recovery first:
+
+1. Click **Re-anchor sync** to flush the fixed audio queues and begin a new timing epoch.
+2. If the sender or receiver still appears frozen, click **Restart Bridge** or use **Tools -> Restart Multichannel NDI Sender**.
+3. Confirm the sender returns to `ACTIVE` and `Paired` begins rising again.
+
+The restart action recreates only the Multichannel DistroAV Main Output and preserves the selected OBS tracks. It has a two-second cooldown to prevent accidental restart loops.
+
+`Oversized blocks` should remain zero. A nonzero value means OBS delivered more than the fixed 4096-frame safety ceiling. `Callback contention drops` should also remain zero; a nonzero value means an unexpected overlapping selected-track callback was discarded instead of blocking OBS audio.
+
+## Receiver has video but no split audio
+
+- Select Stream PC / Receiver.
+- Use one normal DistroAV NDI Source with audio enabled.
+- Select that OBS source in the dock.
+- Create/repair both split sources.
+- Confirm four channels are detected and both proxy sources are active.
+
+## Governor remains WARMING UP or RELOCKING
+
+- Click **Restore recommended settings**, then Apply.
+- Confirm Frame Sync is off and Source Timecode is selected.
+- Confirm the sender is this custom bridge Main Output.
+- Confirm both split sources are active.
+- Restart Main Output and the receiver source after upgrading both PCs.
+
+The default lock requires at least 12 sane A/V observations collected over one second. Startup and recovery packets are held until both the sample count and baseline-learning time are satisfied.
+
+## Governor enters HOLDING
+
+The live status and flight recorder identify the reason:
+
+- `video stall`: video stopped arriving beyond the configured threshold;
+- `audio/video timestamp jump`: a large forward or backward source-time discontinuity;
+- `timestamp repeated/backward`: a non-monotonic frame or block;
+- `A/V deviation exceeded`: movement beyond the hard limit from the learned baseline;
+- `shared playout depth left safe range`: the mapped OBS output timeline became implausibly far ahead of or behind local arrival time.
+
+Copy **Diagnostics** and **A/V flight recorder** before changing settings.
+
+## Audio/video briefly cuts during a fault
+
+This is intentional atomic recovery. Both paths are held rather than allowing one to keep advancing and create a permanent offset. A video stall gets one short audio fade-out packet; the first accepted audio packet after re-lock fades back in.
+
+## Video correction remains at the configured maximum
+
+The measured source clocks are continuing to diverge beyond the correction range. Do not simply raise the value indefinitely. Copy the flight recorder and inspect audio devices, sender timing, network interruptions, and source restarts. A sustained error beyond the hard A/V limit will trigger a new epoch and re-lock.
+
+## Fixed delay feels too high
+
+The default 120 ms is deliberately conservative. Reduce **Shared playout delay** gradually while testing. A lower value reduces latency but leaves less room for arrival jitter. The current minimum is 40 ms. Lower it gradually while watching playout-depth and recovery counters; very small values leave less room for arrival jitter.
+
+## Source settings are not recommended
+
+Enable automatic configuration and Apply, or manually set:
+
+```text
+NDI Frame Sync: Off
+Sync mode: Source Timecode
+Audio: Enabled
 ```
 
-There should be one active copy for the OBS installation being used.
+The governor bypasses enforcement when these conditions are not met rather than risking false blocks.
 
-## Gaming PC has video but no multichannel audio
+## Old missing-plugin warning
 
-1. Confirm the role is **Gaming PC / Sender**.
-2. Confirm DistroAV Main Output is enabled.
-3. Route desktop/game to Track A and mic to Track B.
-4. Use two different tracks at 48 kHz.
-5. Confirm `Paired` rises and `Discarded`/`Silence fallback` remain near zero.
-
-A stable timestamp delta near 21.333 ms at 48 kHz is normal for the two selected OBS mixes.
-
-## Stream PC gets video but no split audio
-
-1. Confirm **Stream PC / Receiver** role.
-2. Use one normal DistroAV NDI Source with audio enabled.
-3. Select that OBS source in the bridge dock.
-4. Create/repair the split sources.
-5. Confirm `Detected channels: 4` and both outputs are active.
-
-## Audio skips or jumps
-
-- Start with NDI Frame Sync disabled on the combined receiver source.
-- Remove old separate NDI desktop/mic sources.
-- Check whether discarded, fallback, or missing counters increased.
-- Inspect both OBS logs for reconnects, buffering changes, source rehooks, or output restarts.
+The bridge is integrated into `distroav.dll`; it does not use `ndi-multichannel-bridge.dll`. Re-run setup with stale Plugin Manager cleanup enabled.
 
 ## Uninstall fails
 
-Close OBS before uninstalling. Review:
-
-```text
-C:\ProgramData\Multichannel Bridge for DistroAV\Installer\uninstall-script.log
-C:\ProgramData\Multichannel Bridge for DistroAV\uninstall.log
-```
-
-The uninstaller refuses to overwrite a `distroav.dll` that changed after bridge installation unless the PowerShell helper is run manually with `-ForceRestore`.
+Close OBS and review the uninstall logs under ProgramData. The helper avoids overwriting a DistroAV DLL that changed after installation unless force restoration is explicitly requested.
