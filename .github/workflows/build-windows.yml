@@ -26,11 +26,47 @@ jobs:
           $version = (Get-Content VERSION -Raw).Trim()
           if (-not $version) { throw 'VERSION is empty.' }
           if ($version -notmatch '^v?(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)') {
-            throw "VERSION must begin with major.minor.patch, for example 0.3.1-alpha. Found: $version"
+            throw "VERSION must begin with major.minor.patch, for example 0.5.0-alpha1. Found: $version"
           }
           $numericVersion = "$($Matches.major).$($Matches.minor).$($Matches.patch).0"
           "version=$version" >> $env:GITHUB_OUTPUT
           "numeric_version=$numericVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Enable MSVC developer tools
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Test standalone A/V Governor
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build-tests | Out-Null
+          cl /nologo /std:c++17 /EHsc /W4 /WX /Ihotfix\bridge `
+            hotfix\bridge\av-governor.cpp tests\av-governor-tests.cpp `
+            /Fe:build-tests\av-governor-tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "A/V Governor test compilation failed with exit code $LASTEXITCODE" }
+          & .\build-tests\av-governor-tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "A/V Governor tests failed with exit code $LASTEXITCODE" }
+
+      - name: Test allocation-free Sender Sync Core
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /Ihotfix\bridge `
+            hotfix\bridge\sender-sync-core.cpp tests\sender-sync-core-tests.cpp `
+            /Fe:build-tests\sender-sync-core-tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "Sender Sync Core test compilation failed with exit code $LASTEXITCODE" }
+          & .\build-tests\sender-sync-core-tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "Sender Sync Core tests failed with exit code $LASTEXITCODE" }
+
+      - name: Audit settings and callback safety
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python tests/test_parameter_paths.py
+          python tests/test_callback_safety.py
+          python tests/test_release_metadata.py
 
       - name: Check out clean DistroAV 6.2.1
         uses: actions/checkout@v4
@@ -47,6 +83,22 @@ jobs:
           $ErrorActionPreference = 'Stop'
           python -m py_compile hotfix/scripts/patch_distroav.py
           python hotfix/scripts/patch_distroav.py distroav
+
+      - name: Export reviewable DistroAV patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location distroav
+          git add -N src/av-governor.cpp src/av-governor.h src/sender-sync-core.cpp src/sender-sync-core.h `
+            src/multichannel-bridge.cpp src/multichannel-bridge.h MULTICHANNEL-BRIDGE.md
+          git diff --binary -- CMakeLists.txt src/plugin-main.cpp src/main-output.cpp src/ndi-output.cpp src/ndi-source.cpp `
+            src/av-governor.cpp src/av-governor.h src/sender-sync-core.cpp src/sender-sync-core.h `
+            src/multichannel-bridge.cpp src/multichannel-bridge.h MULTICHANNEL-BRIDGE.md `
+            | Set-Content -Encoding utf8 "$env:GITHUB_WORKSPACE\Multichannel-Bridge-DistroAV-6.2.1.patch"
+          Pop-Location
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\Multichannel-Bridge-DistroAV-6.2.1.patch")) {
+            throw 'Review patch was not produced.'
+          }
 
       - name: Build custom DistroAV x64
         shell: pwsh
@@ -82,7 +134,11 @@ jobs:
           Copy-Item README.md $package
           Copy-Item INSTALL-BOTH-PCS.md $package
           Copy-Item RELEASE-NOTES.md $package
+          Copy-Item AV-GOVERNOR.md $package
+          Copy-Item UPSTREAM-NOTES.md $package
           Copy-Item LICENSE-NOTICE.txt $package
+          Copy-Item Multichannel-Bridge-DistroAV-6.2.1.patch $package
+          Copy-Item Multichannel-Bridge-DistroAV-6.2.1.patch $dist
 
           # Optional documentation: do not fail the entire Windows build if omitted
           if (Test-Path ROADMAP.md) {
