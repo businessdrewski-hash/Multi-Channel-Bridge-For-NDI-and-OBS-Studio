@@ -130,27 +130,48 @@ jobs:
             Copy-Item -Path "$built\data\locale" -Destination "$package\data\obs-plugins\distroav\locale" -Recurse -Force
           }
 
-          # Required release documentation
+          # Runtime-critical package files
           Copy-Item README.md $package
-          Copy-Item INSTALL-BOTH-PCS.md $package
-          Copy-Item RELEASE-NOTES.md $package
-          Copy-Item AV-GOVERNOR.md $package
-          Copy-Item UPSTREAM-NOTES.md $package
           Copy-Item LICENSE-NOTICE.txt $package
           Copy-Item Multichannel-Bridge-DistroAV-6.2.1.patch $package
           Copy-Item Multichannel-Bridge-DistroAV-6.2.1.patch $dist
 
-          # Optional documentation: do not fail the entire Windows build if omitted
-          if (Test-Path ROADMAP.md) {
-            Copy-Item ROADMAP.md $package
-          } else {
-            Write-Warning 'ROADMAP.md was not found; continuing without it.'
+          # Supplemental documentation must never prevent the binary installer
+          # from compiling. Copy every file that is present and report omissions.
+          $optionalDocs = @(
+            'INSTALL-BOTH-PCS.md',
+            'RELEASE-NOTES.md',
+            'AV-GOVERNOR.md',
+            'UPSTREAM-NOTES.md',
+            'ROADMAP.md'
+          )
+          foreach ($doc in $optionalDocs) {
+            if (Test-Path $doc) {
+              Copy-Item $doc $package
+            } else {
+              Write-Warning "$doc was not found; continuing without it."
+            }
           }
           Copy-Item distroav/LICENSE "$package\DISTROAV-GPL-LICENSE.txt"
           Copy-Item tools/Install-MultichannelBridge.ps1 $package
           Copy-Item tools/Install-MultichannelBridge.cmd $package
           Copy-Item tools/Uninstall-MultichannelBridge.ps1 $package
           Copy-Item tools/Uninstall-MultichannelBridge.cmd $package
+
+          $requiredPackagePaths = @(
+            "$package\obs-plugins",
+            "$package\data",
+            "$package\README.md",
+            "$package\LICENSE-NOTICE.txt",
+            "$package\DISTROAV-GPL-LICENSE.txt",
+            "$package\Install-MultichannelBridge.ps1",
+            "$package\Uninstall-MultichannelBridge.ps1"
+          )
+          foreach ($requiredPath in $requiredPackagePaths) {
+            if (-not (Test-Path $requiredPath)) {
+              throw "Required staged installer input is missing: $requiredPath"
+            }
+          }
 
           @"
           This binary was built from:
