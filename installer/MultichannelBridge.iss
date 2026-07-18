@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.5.0-alpha1-buildfix1"
+  #define AppVersion "0.5.0-alpha1-buildfix2"
 #endif
 #ifndef AppNumericVersion
   #define AppNumericVersion "0.5.0.0"
@@ -37,6 +37,7 @@ OutputBaseFilename=Multichannel-Bridge-for-DistroAV-Setup-v{#AppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 SetupLogging=yes
+SetupMutex=MultichannelBridgeForDistroAVSetup
 CloseApplications=no
 RestartApplications=no
 Uninstallable=yes
@@ -153,23 +154,36 @@ procedure RunInstallScript;
 var
   Parameters: String;
   ResultCode: Integer;
+  ResultPath: String;
+  ResultLines: TArrayOfString;
+  FailureDetail: String;
 begin
   if InstallScriptRan then
     Exit;
   InstallScriptRan := True;
 
+  ResultPath := ExpandConstant('{app}\install-result.txt');
+  DeleteFile(ResultPath);
   SaveStringToFile(ExpandConstant('{app}\selected-obs-path.txt'), ObsDirPage.Values[0], False);
   Parameters := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
     AddQuotes(ExpandConstant('{app}\Install-MultichannelBridge.ps1')) +
     ' -ObsPath ' + AddQuotes(ObsDirPage.Values[0]) +
-    ' -LogPath ' + AddQuotes(ExpandConstant('{app}\install-script.log'));
+    ' -LogPath ' + AddQuotes(ExpandConstant('{app}\install-script.log')) +
+    ' -ResultPath ' + AddQuotes(ResultPath);
   if CleanLegacyCheck.Checked then
     Parameters := Parameters + ' -CleanLegacyPluginManager';
 
   if not Exec(PowerShellExe, Parameters, ExpandConstant('{app}'), SW_SHOW, ewWaitUntilTerminated, ResultCode) then
-    RaiseException('Windows could not start the installation helper.');
-  if ResultCode <> 0 then
-    RaiseException('The installation helper failed. See install-script.log in ' + ExpandConstant('{app}') + '.');
+    RaiseException('Windows could not start the installation helper. No OBS files were intentionally changed.');
+  if ResultCode <> 0 then begin
+    FailureDetail := 'The installation helper failed with exit code ' + IntToStr(ResultCode) + '.';
+    if LoadStringsFromFile(ResultPath, ResultLines) and (GetArrayLength(ResultLines) > 0) then
+      FailureDetail := ResultLines[0];
+    RaiseException(
+      FailureDetail + #13#10 + #13#10 +
+      'The previous DistroAV files were restored when possible.' + #13#10 +
+      'Full log: ' + ExpandConstant('{app}\install-script.log'));
+  end;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

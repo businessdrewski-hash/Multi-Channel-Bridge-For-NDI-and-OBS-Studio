@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1 to DistroAV 6.2.1.
+"""Apply Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2 to DistroAV 6.2.1.
 
 The resulting custom DistroAV package is installed on BOTH computers. The OBS
 Dock selects Gaming PC / Sender or Stream PC / Receiver.
@@ -13,8 +13,8 @@ performs no allocation and adds no callback mutex wait.
 Receiver mode intercepts DistroAV's raw planar NDI audio before OBS remixes it,
 then exposes channels 1-2 and 3-4 as two independent stereo OBS mixer sources.
 
-A/V Governor 1.2 gives the sender audio and video explicit timecodes derived from
-the same OBS monotonic clock. On the receiver it adds one shared playout delay, gently paces video timestamps
+A/V Governor 1.2 observes the sender and receiver timing paths without replacing
+DistroAV's proven synthesized NDI transport timecodes. On the receiver it adds one shared playout delay, gently paces video timestamps
 for verified gradual drift, and atomically holds/re-locks both paths after stalls
 or timestamp discontinuities.
 """
@@ -26,7 +26,7 @@ import re
 import shutil
 from pathlib import Path
 
-PATCH_MARKER = "Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1"
+PATCH_MARKER = "Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -198,6 +198,32 @@ def patch_ndi_source(path: Path) -> None:
         "\t\tobs_source_output_video(obs_source, obs_video_frame);\n"
     )
     text = replace_once(text, old_video, new_video, "raw receiver video governor hook")
+    reconnect_proc = r'''
+static void mcb_force_reconnect_proc(void *data, calldata_t *params)
+{
+	auto *source = static_cast<ndi_source_t *>(data);
+	const bool accepted = source != nullptr;
+	if (source)
+		source->config.reset_ndi_receiver = true;
+	if (params)
+		calldata_set_bool(params, "accepted", accepted);
+}
+
+'''
+    text = replace_once(
+        text,
+        "void *ndi_source_create(obs_data_t *settings, obs_source_t *obs_source)\n",
+        reconnect_proc + "void *ndi_source_create(obs_data_t *settings, obs_source_t *obs_source)\n",
+        "receiver reconnect procedure",
+    )
+    text = replace_once(
+        text,
+        "\tndi_source_update(s, settings);\n",
+        "\tndi_source_update(s, settings);\n"
+        "\tproc_handler_add(obs_source_get_proc_handler(obs_source),\n"
+        "\t\t\"void mcb_force_reconnect(out bool accepted)\", mcb_force_reconnect_proc, s);\n",
+        "receiver reconnect registration",
+    )
     path.write_text(text, encoding="utf-8", newline="\n")
     print(f"Patched: {path}")
 
@@ -218,7 +244,7 @@ def patch_ndi_output(path: Path) -> None:
     )
 
     state_types = r'''
-// Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1. SenderSyncCore owns all
+// Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2. SenderSyncCore owns all
 // sample storage up front. The atomic flag is a non-blocking safety guard: OBS
 // normally serializes selected-mixer callbacks, but an unexpected concurrent
 // callback is dropped instead of waiting on the real-time audio thread.
@@ -441,18 +467,11 @@ void ndi_output_rawaudio2(void *data, size_t mix_idx, audio_data *frame)
         "\tvideo_frame.timecode = NDIlib_send_timecode_synthesize;\n",
         "\tif (o->multichannel_audio)\n"
         "\t\tmcb_sender_observe_video(frame->timestamp);\n"
-        "\tvideo_frame.timecode = (o->multichannel_audio && frame->timestamp)\n"
-        "\t\t? (int64_t)(frame->timestamp / 100ULL)\n"
-        "\t\t: NDIlib_send_timecode_synthesize;\n",
-        "shared OBS video timecode",
-    )
-    text = replace_once(
-        text,
-        "\taudio_frame.timecode = NDIlib_send_timecode_synthesize;\n",
-        "\taudio_frame.timecode = (o->multichannel_audio && frame->timestamp)\n"
-        "\t\t? (int64_t)(frame->timestamp / 100ULL)\n"
-        "\t\t: NDIlib_send_timecode_synthesize;\n",
-        "shared OBS audio timecode",
+        "\t// Preserve DistroAV's known-good NDI transport clock. Raw OBS\n"
+        "\t// monotonic timestamps are local to the gaming PC and must not be\n"
+        "\t// exported as receiver playout timecodes.\n"
+        "\tvideo_frame.timecode = NDIlib_send_timecode_synthesize;\n",
+        "sender video observation hook",
     )
 
     text = replace_once(
@@ -495,7 +514,7 @@ def copy_bridge_files(root: Path, bridge_dir: Path) -> None:
 
 def write_notice(root: Path) -> None:
     (root / "MULTICHANNEL-BRIDGE.md").write_text(
-        "# Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1\n\n"
+        "# Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2\n\n"
         "Custom DistroAV 6.2.1 build. Install the same package on both PCs, then use "
         "Docks > Multichannel Bridge for DistroAV to select Gaming PC / Sender or Stream PC / Receiver.\n\n"
         "Sender defaults: OBS Track 5 -> NDI channels 1-2; OBS Track 6 -> channels 3-4.\n"
@@ -503,8 +522,8 @@ def write_notice(root: Path) -> None:
         "pairs as independent OBS audio-only sources.\n\n"
         "Sender Sync Core 2.0 uses fixed preallocated audio storage, canonical mix-interval timestamps, "
         "automatic discontinuity re-anchoring, and no blocking callback lock. A/V Governor 1.2 uses "
-        "explicit sender timecodes, one shared playout delay, bounded video pacing, "
-        "and atomic hold/re-lock recovery after stalls or timestamp jumps. It is optional and enabled by default.\n\n"
+        "DistroAV's synthesized transport timecodes, one shared playout delay, bounded video pacing, "
+        "and fail-open re-lock recovery after stalls or timestamp jumps. It is optional and enabled by default.\n\n"
         "Experimental. Not affiliated with or endorsed by DistroAV. DistroAV remains GPL-2.0-or-later.\n",
         encoding="utf-8",
         newline="\n",
@@ -537,11 +556,13 @@ def verify(root: Path) -> None:
         "obs_frontend_add_dock_by_id",
         "mcb_receiver_route_audio(obs_source, obs_audio_frame, channelCount,",
         "mcb_receiver_route_video(obs_source, obs_video_frame,",
-        "frame->timestamp / 100ULL",
+        "NDIlib_send_timecode_synthesize",
         'kGovernorVersion = "1.2"',
         "GovernorPlayoutDelayMs",
         "governor_flight_recorder_csv",
         "mcb_receiver_route_video",
+        "mcb_force_reconnect_proc",
+        "void mcb_force_reconnect(out bool accepted)",
         "class AVGovernor",
         "mcb_sender_status_sync",
         "class SenderSyncCore",
@@ -556,6 +577,8 @@ def verify(root: Path) -> None:
     missing = [item for item in required if item not in joined]
     if missing:
         raise RuntimeError("Patch verification failed; missing: " + ", ".join(missing))
+    if "frame->timestamp / 100ULL" in joined:
+        raise RuntimeError("Patch verification failed; raw sender OBS timestamps leaked into NDI timecodes")
     print("Patch verification passed.")
 
 

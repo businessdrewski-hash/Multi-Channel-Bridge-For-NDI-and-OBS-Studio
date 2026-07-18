@@ -1,4 +1,4 @@
-# Validation notes for v0.5.0-alpha1-buildfix1
+# Validation notes for v0.5.0-alpha1-buildfix2
 
 Completed in the source-generation environment:
 
@@ -17,6 +17,9 @@ Design properties enforced by code and release tests:
 - Sender raw-audio callbacks never wait for another callback.
 - UI/control actions use atomic generation requests.
 - Sender queues have a fixed four-block ceiling.
+- Receiver timing recovery fails open, preserves synthesized NDI transport timecodes, and cannot blank a live feed.
+- Receiver proxy sources are audio-active and explicit repair clears mute/zero-volume/empty-routing states.
+- Existing DistroAV receiver sources expose an in-place reconnect procedure.
 - Monitoring peak scans and the dock timer stop while the dock is hidden.
 - Receiver fade scratch storage is fixed-size.
 

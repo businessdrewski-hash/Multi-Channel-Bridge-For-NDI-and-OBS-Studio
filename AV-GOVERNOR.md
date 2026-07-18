@@ -16,10 +16,10 @@ The receiver hook sees both the raw NDI `timestamp`/`timecode` values and the OB
 4. estimates persistent drift only after enough time and samples produce a high-confidence trend;
 5. keeps audio sample-perfect and makes bounded, frame-boundary video timestamp corrections only for confirmed gradual drift;
 6. detects stalls, backward/repeated timestamps, large jumps, unsafe playout depth, and excessive movement away from baseline;
-7. performs an atomic hold, clears the old timing epoch, learns a fresh baseline, and resumes with a short audio fade-in;
+7. clears the old timing epoch and learns a fresh baseline while normal DistroAV output continues in fail-open mode;
 8. exports a fixed-size CSV flight recorder containing raw NDI timing, OBS timing, skew, drift, playout depth, corrections, and recovery events.
 
-On a video stall, one audio packet receives a controlled fade-out before further audio is gated. The first accepted audio packet after re-lock receives a fade-in. Audio is not resampled, stretched, or PPM-adjusted.
+The core records which packets it would gate during a video stall or re-lock, but the OBS adapter fails open with the original DistroAV timestamps. This keeps the feed visible and audible while protection reacquires. Audio is not resampled, stretched, or PPM-adjusted.
 
 ## Recommended defaults
 

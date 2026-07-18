@@ -7,7 +7,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-if version != "0.5.0-alpha1-buildfix1":
+if version != "0.5.0-alpha1-buildfix2":
     raise SystemExit(f"Unexpected VERSION: {version}")
 
 checks = {
@@ -48,6 +48,8 @@ required = (
     "tests/av-governor-tests.cpp",
     "tests/test_parameter_paths.py",
     "tests/test_callback_safety.py",
+    "tests/test_installer_contract.py",
+    "tests/test_receiver_safety.py",
 )
 for relative in required:
     if not (ROOT / relative).is_file():

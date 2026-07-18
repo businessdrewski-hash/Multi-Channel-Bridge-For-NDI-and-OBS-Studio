@@ -53,7 +53,7 @@ constexpr const char *kSection = "NDIMultichannelBridge";
 constexpr const char *kDockId = "distroav_multichannel_bridge_v030";
 constexpr const char *kProgramSourceId = "ndi_multichannel_bridge_program_audio";
 constexpr const char *kMicSourceId = "ndi_multichannel_bridge_mic_audio";
-constexpr const char *kVersion = "0.5.0-alpha1-buildfix1";
+constexpr const char *kVersion = "0.5.0-alpha1-buildfix2";
 constexpr const char *kGovernorVersion = "1.2";
 constexpr const char *kSenderCoreVersion = "2.0";
 constexpr const char *kDefaultProgramName = "MCB Desktop / Game";
@@ -312,11 +312,38 @@ public:
 		obs_source_update(source, settings);
 		obs_data_release(settings);
 		obs_source_release(source);
+		const bool reconnect_requested = force_reconnect();
 		governor_.set_source_configured(true);
 		governor_.reset(false);
 		obs_log(LOG_INFO,
-			"[multichannel-bridge] A/V Governor applied recommended source timing: Frame Sync off, Source Timecode on");
+			"[multichannel-bridge] Applied recommended source timing and requested receiver reconnect: %s",
+			reconnect_requested ? "yes" : "procedure unavailable");
 		return true;
+	}
+
+	bool force_reconnect()
+	{
+		obs_source_t *source = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			if (input_)
+				source = obs_source_get_ref(input_);
+		}
+		if (!source)
+			return false;
+
+		calldata_t params{};
+		calldata_init(&params);
+		const bool procedure_found = proc_handler_call(
+			obs_source_get_proc_handler(source), "mcb_force_reconnect", &params);
+		const bool accepted = procedure_found && calldata_bool(&params, "accepted");
+		calldata_free(&params);
+		obs_source_release(source);
+		if (accepted) {
+			reset_governor(false);
+			obs_log(LOG_INFO, "[multichannel-bridge] Requested an in-place DistroAV receiver reconnect");
+		}
+		return accepted;
 	}
 
 	bool refresh_source_configuration()
@@ -370,11 +397,12 @@ public:
 		if (split_active)
 			audio_decision = governor_.process_audio(audio->timestamp, now_ns, ndi_timestamp_100ns, ndi_timecode_100ns);
 		if (!audio_decision.accept) {
-			for (auto *output : outputs) {
-				if (output)
-					obs_source_release(output);
-			}
-			return true;
+			// Fail open. Timing protection must never make a live NDI source
+			// disappear while the governor is learning or re-locking.
+			audio_decision.accept = true;
+			audio_decision.output_timestamp_ns = audio->timestamp;
+			audio_decision.audio_gain_start = 1.0f;
+			audio_decision.audio_gain_end = 1.0f;
 		}
 
 		const bool apply_gain = audio->format == AUDIO_FORMAT_FLOAT_PLANAR &&
@@ -449,7 +477,9 @@ public:
 		const auto decision = governor_.process_video(video->timestamp, os_gettime_ns(), ndi_timestamp_100ns, ndi_timecode_100ns);
 		if (decision.accept)
 			video->timestamp = decision.output_timestamp_ns;
-		return decision.accept;
+		// Fail open with the original DistroAV timestamp during acquisition or
+		// recovery. A timing controller may degrade to monitoring, never black video.
+		return true;
 	}
 
 	mcb::AVGovernorSnapshot governor_snapshot() const { return governor_.snapshot(); }
@@ -566,6 +596,10 @@ void *create_proxy_common(obs_source_t *source, int pair)
 	auto *context = new ProxyContext;
 	context->source = source;
 	context->pair = pair;
+	// Audio-only proxy sources must explicitly participate in OBS's mixer.
+	// OBS documents this flag as controlling whether a source is shown and active
+	// in the audio mixer; outputting packets alone is not sufficient.
+	obs_source_set_audio_active(source, true);
 	ReceiverRouter::instance().register_proxy(pair, source);
 	return context;
 }
@@ -579,6 +613,7 @@ void destroy_proxy(void *data)
 	if (!context)
 		return;
 	ReceiverRouter::instance().unregister_proxy(context->pair, context->source);
+	obs_source_set_audio_active(context->source, false);
 	delete context;
 }
 
@@ -622,7 +657,7 @@ obs_source_t *get_or_create_proxy(const char *id, const char *name)
 	return obs_source_create(id, name, nullptr, nullptr);
 }
 
-bool add_proxy_to_current_scene(const char *id, const char *name)
+bool add_proxy_to_current_scene(const char *id, const char *name, bool repair_audio_state)
 {
 	obs_source_t *current_scene_source = obs_frontend_get_current_scene();
 	if (!current_scene_source)
@@ -633,6 +668,14 @@ bool add_proxy_to_current_scene(const char *id, const char *name)
 	if (scene && proxy) {
 		if (!source_in_current_scene(scene, name))
 			obs_scene_add(scene, proxy);
+		obs_source_set_audio_active(proxy, true);
+		if (repair_audio_state) {
+			obs_source_set_muted(proxy, false);
+			if (obs_source_get_volume(proxy) <= 0.0001f)
+				obs_source_set_volume(proxy, 1.0f);
+			if (obs_source_get_audio_mixers(proxy) == 0)
+				obs_source_set_audio_mixers(proxy, 0x3fU);
+		}
 		success = true;
 	}
 	if (proxy)
@@ -743,12 +786,14 @@ public:
 		auto *receiver_form = new QFormLayout(receiver_box_);
 		receiver_source_ = new QComboBox(receiver_box_);
 		refresh_ = new QPushButton("Refresh NDI sources", receiver_box_);
+		reconnect_receiver_ = new QPushButton("Reconnect", receiver_box_);
 		open_source_ = new QPushButton("Open properties", receiver_box_);
 		auto *source_row = new QWidget(receiver_box_);
 		auto *source_row_layout = new QHBoxLayout(source_row);
 		source_row_layout->setContentsMargins(0, 0, 0, 0);
 		source_row_layout->addWidget(receiver_source_, 1);
 		source_row_layout->addWidget(refresh_);
+		source_row_layout->addWidget(reconnect_receiver_);
 		source_row_layout->addWidget(open_source_);
 		receiver_form->addRow("DistroAV NDI video source:", source_row);
 
@@ -767,7 +812,7 @@ public:
 		max_skew_ms_->setRange(40, 500);
 		max_skew_ms_->setSuffix(" ms");
 		max_skew_ms_->setToolTip(
-			"Hard safety limit. If A/V movement exceeds this, both paths pause and re-lock together.");
+			"Hard safety limit. If A/V movement exceeds this, correction pauses and the model re-locks while normal output continues.");
 		video_stall_ms_ = new QSpinBox(governor_box_);
 		video_stall_ms_->setRange(60, 1000);
 		video_stall_ms_->setSuffix(" ms");
@@ -811,8 +856,8 @@ public:
 		drift_deadband_ppm_->setToolTip(
 			"Ignore smaller estimated clock differences so normal jitter cannot trigger correction.");
 		governor_help_ = new QLabel(
-			"Recommended mode maps both paths onto one future timeline in OBS's native async queues, learns a one-second median baseline, "
-			"ignores short jitter, adjusts only video after confirmed drift, and re-locks both paths together after a fault.", governor_box_);
+			"Recommended mode learns a one-second median baseline, ignores short jitter, adjusts only video after confirmed drift, "
+			"and fails open with normal DistroAV output whenever its timing model is not ready.", governor_box_);
 		governor_help_->setWordWrap(true);
 		governor_status_ = new QLabel(governor_box_);
 		governor_status_->setWordWrap(true);
@@ -896,6 +941,12 @@ public:
 		connect(receiver_radio_, &QRadioButton::toggled, this, [this] { role_changed(); });
 		connect(confirm_, &QCheckBox::toggled, this, [this] { apply_->setEnabled(confirm_->isChecked()); });
 		connect(refresh_, &QPushButton::clicked, this, [this] { refresh_sources(); });
+		connect(reconnect_receiver_, &QPushButton::clicked, this, [this] {
+			const bool ok = ReceiverRouter::instance().force_reconnect();
+			checklist_->setText(ok
+				? "Existing DistroAV source reconnected in place; scene layout and filters were preserved."
+				: "Reconnect was unavailable. Confirm this is a DistroAV NDI Source created by the bridge build.");
+		});
 		connect(advanced_governor_, &QCheckBox::toggled, this, [this](bool visible) {
 			advanced_governor_panel_->setVisible(visible);
 		});
@@ -1154,8 +1205,9 @@ private:
 			ReceiverRouter::instance().refresh_source_configuration();
 		if (create_sources) {
 			const bool program_ok = add_proxy_to_current_scene(
-				kProgramSourceId, program_name_->text().toUtf8().constData());
-			const bool mic_ok = add_proxy_to_current_scene(kMicSourceId, mic_name_->text().toUtf8().constData());
+				kProgramSourceId, program_name_->text().toUtf8().constData(), true);
+			const bool mic_ok = add_proxy_to_current_scene(
+				kMicSourceId, mic_name_->text().toUtf8().constData(), true);
 			checklist_->setText(program_ok && mic_ok
 						   ? "Receiver attached and both split audio sources are present in the current scene."
 						   : "Receiver attached, but one or both split sources could not be added. Check for duplicate names.");
@@ -1353,7 +1405,7 @@ private:
 		const auto governor = router.governor_snapshot();
 		QString governor_state = QString::fromUtf8(governor_phase_name(governor.phase));
 		if (governor.video_stalled)
-			governor_state = "VIDEO STALL — holding both paths";
+			governor_state = "VIDEO STALL — correction bypassed while re-locking";
 		const QString config_warning = governor.enabled && !governor.source_configured
 			? " · source settings not recommended"
 			: "";
@@ -1366,7 +1418,7 @@ private:
 		governor_status_->setText(
 			QString("%1 · delay/depth A/V %2/%3/%4 ms · skew raw/filtered/base %5/%6/%7 ms · "
 				"deviation %8 ms · drift %9 ppm (%10%) · video correction %11→%12 ms · "
-				"blocked A/V %13/%14 · recoveries %15 · fades %16/%17%18%19")
+				"bypassed A/V decisions %13/%14 · recoveries %15 · fades %16/%17%18%19")
 				.arg(governor_state)
 				.arg(static_cast<double>(governor.playout_delay_ns) / 1e6, 0, 'f', 0)
 				.arg(static_cast<double>(governor.audio_playout_depth_ns) / 1e6, 0, 'f', 1)
@@ -1401,6 +1453,7 @@ private:
 	QPushButton *restart_sender_ = nullptr;
 	QComboBox *receiver_source_ = nullptr;
 	QPushButton *refresh_ = nullptr;
+	QPushButton *reconnect_receiver_ = nullptr;
 	QPushButton *open_source_ = nullptr;
 	QGroupBox *governor_box_ = nullptr;
 	QCheckBox *auto_configure_ = nullptr;

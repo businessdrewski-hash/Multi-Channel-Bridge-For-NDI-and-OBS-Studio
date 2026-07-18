@@ -1,6 +1,6 @@
 # Roadmap
 
-## Implemented through 0.5.0-alpha1-buildfix1
+## Implemented through 0.5.0-alpha1-buildfix2
 
 - Robust baseline learning and median jitter filtering
 - High-confidence drift-rate estimation

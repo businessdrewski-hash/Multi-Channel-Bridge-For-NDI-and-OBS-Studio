@@ -1,4 +1,18 @@
-# v0.5.0-alpha1-buildfix1 release notes
+# v0.5.0-alpha1-buildfix2 release notes
+
+## Buildfix 2
+
+- Promotes the Windows installer EXE to its own required build artifact.
+- Manual workflow runs can publish the EXE, checksum, portable ZIP, and source patch directly as a GitHub prerelease.
+- Verifies the installer file has a Windows PE `MZ` header before publishing it.
+- Replaces the generic install-helper failure with the exact failed stage and error message.
+- Writes `install-result.txt` beside the full installer log for quick diagnosis.
+- Creates a short-lived snapshot of the immediately previous DistroAV DLL and data, restoring them if file installation or verification fails.
+- Validates the packaged DLL and payload before starting OBS file changes.
+- Reverts raw game-PC OBS timestamps as exported NDI timecodes and restores DistroAV's proven synthesized transport clock.
+- Makes receiver timing protection fail open during warm-up, faults, and re-locks so it cannot create a black or silent feed.
+- Adds an in-place DistroAV receiver reconnect procedure so stale upgraded sources no longer need to be deleted and recreated.
+- Marks the two split proxy sources audio-active and repairs muted, zero-volume, or unrouted tracks when the user explicitly runs Create / repair.
 
 ## Buildfix 1
 
@@ -50,8 +64,8 @@ OBS Track B -> NDI channels 3-4 -> Microphone
 The GitHub Action builds:
 
 ```text
-Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix1.exe
-Multichannel-Bridge-for-DistroAV-v0.5.0-alpha1-buildfix1-Portable-Windows-x64.zip
+Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix2.exe
+Multichannel-Bridge-for-DistroAV-v0.5.0-alpha1-buildfix2-Portable-Windows-x64.zip
 Multichannel-Bridge-DistroAV-6.2.1.patch
 SHA256SUMS.txt
 ```

@@ -2,14 +2,15 @@
 param(
     [string]$ObsPath = "C:\Program Files\obs-studio",
     [switch]$CleanLegacyPluginManager,
-    [string]$LogPath
+    [string]$LogPath,
+    [string]$ResultPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $productName = 'Multichannel Bridge for DistroAV'
-$version = '0.5.0-alpha1-buildfix1'
+$version = '0.5.0-alpha1-buildfix2'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $stateRoot = Join-Path $env:ProgramData $productName
 $legacyStateRoot = Join-Path $env:ProgramData 'NDI-Multichannel-Bridge'
@@ -19,12 +20,34 @@ New-Item -ItemType Directory -Force $stateRoot | Out-Null
 if ([string]::IsNullOrWhiteSpace($LogPath)) {
     $LogPath = Join-Path $stateRoot 'install.log'
 }
+if ([string]::IsNullOrWhiteSpace($ResultPath)) {
+    $ResultPath = Join-Path $stateRoot 'install-result.txt'
+}
+
+$stage = 'initialization'
+$rollbackRoot = $null
+$installedDll = $null
+$installedData = $null
+$rollbackDllExisted = $false
+$rollbackDataExisted = $false
+$installationMutationStarted = $false
 
 function Write-Log {
     param([string]$Message)
     $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message
     Write-Host $line
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+}
+
+function Write-InstallResult {
+    param([Parameter(Mandatory)][string]$Message)
+    Set-Content -LiteralPath $ResultPath -Value $Message -Encoding UTF8
+}
+
+function Set-InstallStage {
+    param([Parameter(Mandatory)][string]$Name)
+    $script:stage = $Name
+    Write-Log "Stage: $Name"
 }
 
 function Test-Administrator {
@@ -63,6 +86,7 @@ function Backup-DirectoryOnce {
 }
 
 try {
+    Set-InstallStage 'preflight checks'
     if (-not (Test-Administrator)) {
         throw 'Administrator rights are required.'
     }
@@ -84,7 +108,12 @@ try {
     if (-not (Test-Path -LiteralPath $packageData)) {
         throw "Installer payload is missing: $packageData"
     }
+    $packageHash = (Get-FileHash -LiteralPath $packageDll -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ((Get-Item -LiteralPath $packageDll).Length -lt 1024) {
+        throw "Installer payload is not a valid-sized DistroAV DLL: $packageDll"
+    }
 
+    Set-InstallStage 'preparing backups'
     $installKey = ConvertTo-PathKey -Path $ObsPath
     $backupRoot = Join-Path $stateRoot (Join-Path 'backup' $installKey)
     New-Item -ItemType Directory -Force $backupRoot | Out-Null
@@ -116,6 +145,22 @@ try {
     $installedData = Join-Path $ObsPath 'data\obs-plugins\distroav'
     $originalStatePath = Join-Path $backupRoot 'original-state.json'
 
+    # Preserve the exact pre-attempt state for automatic rollback. This is
+    # separate from the permanent pre-bridge backup used by uninstallation.
+    $rollbackRoot = Join-Path $stateRoot 'pending-install-rollback'
+    if (Test-Path -LiteralPath $rollbackRoot) {
+        Remove-Item -LiteralPath $rollbackRoot -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force $rollbackRoot | Out-Null
+    $rollbackDllExisted = Test-Path -LiteralPath $installedDll
+    $rollbackDataExisted = Test-Path -LiteralPath $installedData
+    if ($rollbackDllExisted) {
+        Copy-Item -LiteralPath $installedDll -Destination (Join-Path $rollbackRoot 'distroav.dll') -Force
+    }
+    if ($rollbackDataExisted) {
+        Copy-Item -LiteralPath $installedData -Destination (Join-Path $rollbackRoot 'distroav-data') -Recurse -Force
+    }
+
     # Preserve the pre-bridge DistroAV installation only once. Future upgrades
     # keep this original backup rather than backing up an older bridge build.
     if (-not (Test-Path -LiteralPath $originalStatePath)) {
@@ -137,6 +182,7 @@ try {
         Write-Log 'Created one-time backup of the pre-bridge DistroAV installation.'
     }
 
+    Set-InstallStage 'checking existing installations'
     $previousState = $null
     if (Test-Path -LiteralPath $manifestPath) {
         try { $previousState = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json } catch { $previousState = $null }
@@ -217,6 +263,8 @@ try {
         }
     }
 
+    Set-InstallStage 'installing plugin files'
+    $installationMutationStarted = $true
     foreach ($folder in @('obs-plugins', 'data')) {
         $source = Join-Path $here $folder
         $destination = Join-Path $ObsPath $folder
@@ -227,7 +275,7 @@ try {
         Copy-Item -Path (Join-Path $source '*') -Destination $destination -Recurse -Force
     }
 
-    $packageHash = (Get-FileHash -LiteralPath $packageDll -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-InstallStage 'verifying installed files'
     $installedHash = (Get-FileHash -LiteralPath $installedDll -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($packageHash -ne $installedHash) {
         throw 'The installed distroav.dll hash does not match the installer payload.'
@@ -247,6 +295,7 @@ try {
         throw "Expected exactly one active distroav.dll after installation, found $($activeDlls.Count): $($activeDlls -join '; ')"
     }
 
+    Set-InstallStage 'saving installation state'
     $state = [ordered]@{
         product = $productName
         version = $version
@@ -260,11 +309,41 @@ try {
     }
     $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 
+    if (Test-Path -LiteralPath $rollbackRoot) {
+        Remove-Item -LiteralPath $rollbackRoot -Recurse -Force
+    }
+    Write-InstallResult "SUCCESS: $productName $version installed to $ObsPath"
     Write-Log "$productName $version installed successfully to $ObsPath"
     Write-Log 'Install the same setup executable on both PCs, then choose the role in Docks > Multichannel Bridge for DistroAV.'
     exit 0
 } catch {
-    Write-Log ("INSTALL FAILED: " + $_.Exception.Message)
+    $failureMessage = "FAILED during $stage`: $($_.Exception.Message)"
+    Write-Log ("INSTALL FAILED: " + $failureMessage)
+    if ($installationMutationStarted -and $rollbackRoot -and (Test-Path -LiteralPath $rollbackRoot)) {
+        try {
+            Write-Log 'Restoring the DistroAV state from immediately before this install attempt.'
+            if ($installedDll -and (Test-Path -LiteralPath $installedDll)) {
+                Remove-Item -LiteralPath $installedDll -Force
+            }
+            if ($installedData -and (Test-Path -LiteralPath $installedData)) {
+                Remove-Item -LiteralPath $installedData -Recurse -Force
+            }
+            if ($rollbackDllExisted) {
+                New-Item -ItemType Directory -Force (Split-Path -Parent $installedDll) | Out-Null
+                Copy-Item -LiteralPath (Join-Path $rollbackRoot 'distroav.dll') -Destination $installedDll -Force
+            }
+            if ($rollbackDataExisted) {
+                New-Item -ItemType Directory -Force (Split-Path -Parent $installedData) | Out-Null
+                Copy-Item -LiteralPath (Join-Path $rollbackRoot 'distroav-data') -Destination $installedData -Recurse -Force
+            }
+            $failureMessage += ' Previous DistroAV files were restored.'
+            Write-Log 'Rollback completed.'
+        } catch {
+            $failureMessage += " AUTOMATIC ROLLBACK ALSO FAILED: $($_.Exception.Message)"
+            Write-Log $failureMessage
+        }
+    }
+    Write-InstallResult $failureMessage
     Write-Error $_
     exit 1
 }

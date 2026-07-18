@@ -1,7 +1,7 @@
 # Multichannel Bridge for DistroAV
 
 > Experimental modified DistroAV build for two-PC OBS setups
-> Current version: **0.5.0-alpha1-buildfix1**
+> Current version: **0.5.0-alpha1-buildfix2**
 > Based on: **DistroAV 6.2.1**
 
 ## Personal project and support disclaimer
@@ -65,8 +65,8 @@ It:
 - maps both streams onto the same future OBS playout timeline, using OBS's native asynchronous source queues instead of copying 4K video frames into another buffer;
 - estimates gradual drift only after a sustained, high-confidence trend is present;
 - keeps audio sample-perfect and applies bounded corrections only to video timestamps at video-frame boundaries;
-- atomically holds and re-locks both paths after stalls, backward/repeated timestamps, large jumps, unsafe playout depth, or excessive movement away from baseline;
-- fades audio out at a detected video stall and back in after a clean re-lock;
+- re-locks its internal timing model after stalls, backward/repeated timestamps, large jumps, unsafe playout depth, or excessive movement away from baseline;
+- fails open with normal DistroAV timestamps while warming up or re-locking, so timing protection cannot blank a live feed;
 - exports a bounded CSV flight recorder and plain-text diagnostic bundle.
 
 The governor does not PPM-adjust, resample, stretch, or cut audio. See [`AV-GOVERNOR.md`](AV-GOVERNOR.md) for detailed behavior and limitations.
@@ -82,7 +82,7 @@ flowchart LR
         A[OBS Track 5\nGame / Program stereo]
         B[OBS Track 6\nMicrophone stereo]
         M[Sender Sync Core 2.0\nFixed four-channel packer]
-        D[Patched DistroAV Main Output\nShared OBS-derived timecodes]
+        D[Patched DistroAV Main Output\nKnown-good synthesized NDI timecodes]
         A --> M
         B --> M
         V --> D
@@ -113,7 +113,7 @@ flowchart LR
 - Two configurable OBS stereo tracks carried as four NDI audio channels
 - Separate program/game and microphone sources on the stream PC
 - Fixed-capacity, preallocated Sender Sync Core 2.0
-- Shared OBS-derived sender timecodes using the canonical mix-interval start
+- Proven DistroAV synthesized NDI transport timecodes; raw game-PC OBS clocks stay diagnostic-only
 - Automatic sender epoch re-anchor after timestamp discontinuities
 - One-click sender re-anchor and full NDI Main Output restart
 - No callback-time bridge allocation, queue growth, UI work, or added packing lock
@@ -121,12 +121,14 @@ flowchart LR
 - Raw NDI timing fields recorded beside converted OBS timestamps
 - Shared configurable OBS-native playout timeline
 - Confidence-gated, frame-boundary video-only drift correction
-- Atomic hold and timed re-lock after stalls or timestamp discontinuities
+- Fail-open timed re-lock after stalls or timestamp discontinuities
 - Fade-assisted audio boundaries during recovery
 - Monotonic epoch rebasing after sender/source clock restarts
 - Fixed-size A/V flight recorder with one-click diagnostic export
 - Four-block fixed sender audio queues and preallocated silence fallback
 - Duplicate combined-audio suppression
+- In-place receiver reconnect after upgrades without deleting the OBS source
+- Split proxy sources explicitly marked audio-active; Create / repair fixes mute, zero volume, and empty mixer routing
 - Live sender, receiver, and governor diagnostics
 - One package for both PCs with beginner-friendly role selection
 - Windows EXE installer with backup, duplicate cleanup, hash verification, upgrade support, and uninstall restoration
@@ -157,7 +159,7 @@ Compatibility outside that environment is not guaranteed.
 
 Install the same release on both computers.
 
-1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix1.exe`.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix2.exe`.
 2. Close OBS completely.
 3. Run the installer as Administrator on both PCs.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
@@ -260,7 +262,7 @@ The status line reports the reason. Common causes are video stall, backward/repe
 
 ### Audio briefly cuts during a fault
 
-The governor may intentionally hold audio and video together instead of allowing audio to continue ahead and create a permanent offset. Review `Blocked audio/video`, `Discontinuities`, `Atomic recoveries`, sender discards/fallback, and the CSV flight recorder.
+The governor now keeps normal DistroAV output visible while its internal model re-locks. Review `Bypassed A/V decisions`, `Discontinuities`, `Recoveries`, sender discards/fallback, and the CSV flight recorder. Timing protection must never turn a measurable sync problem into a black or silent feed.
 
 ### Duplicate DistroAV menus
 
@@ -275,6 +277,14 @@ More detail: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
 ---
 
 ## Consolidated changelog
+
+### 0.5.0-alpha1-buildfix2
+
+- Makes the Windows installer EXE the primary release artifact.
+- Publishes the EXE directly to a GitHub prerelease when requested from the manual Windows workflow.
+- Adds named install stages, a one-line result file, and exact error text in the installer dialog.
+- Adds an immediate pre-install rollback snapshot so a failed DLL/data replacement restores the prior DistroAV state.
+- Validates the staged DLL before the installer starts changing OBS files.
 
 ### 0.5.0-alpha1-buildfix1
 
