@@ -1,4 +1,4 @@
-# A/V Governor 1.2
+# A/V Governor 1.3
 
 A/V Governor is an optional receiver-side timing subsystem inside the same custom DistroAV build as Multichannel Bridge.
 
@@ -11,13 +11,14 @@ Prevent a healthy audio/video relationship from separating before DistroAV submi
 The receiver hook sees both the raw NDI `timestamp`/`timecode` values and the OBS timestamps produced by DistroAV. Before `obs_source_output_audio` or `obs_source_output_video` is called, the governor:
 
 1. projects the latest audio and video clocks to one common local instant;
-2. median-filters short jitter and learns the normal fixed A/V offset over a configurable time window;
+2. median-filters short jitter and establishes a trusted fixed A/V reference only after at least five stable seconds;
 3. maps both streams onto the same future OBS playout timeline, using OBS's native asynchronous source queues rather than copying 4K video frames into another custom buffer;
 4. estimates persistent drift only after enough time and samples produce a high-confidence trend;
 5. keeps audio sample-perfect and makes bounded, frame-boundary video timestamp corrections only for confirmed gradual drift;
 6. detects stalls, backward/repeated timestamps, large jumps, unsafe playout depth, and excessive movement away from baseline;
-7. clears the old timing epoch and learns a fresh baseline while normal DistroAV output continues in fail-open mode;
-8. exports a fixed-size CSV flight recorder containing raw NDI timing, OBS timing, skew, drift, playout depth, corrections, and recovery events.
+7. preserves the trusted reference, quarantines post-fault samples for two seconds, and verifies a stable recovery candidate against that reference;
+8. makes one in-place receiver reconnect attempt and then enters fail-safe bypass if the candidate is unsafe or recovery repeatedly fails;
+9. exports protected critical events and rate-limited telemetry containing raw NDI timing, OBS timing, skew, drift, playout depth, corrections, and recovery events.
 
 The core records which packets it would gate during a video stall or re-lock, but the OBS adapter fails open with the original DistroAV timestamps. This keeps the feed visible and audible while protection reacquires. Audio is not resampled, stretched, or PPM-adjusted.
 
@@ -29,25 +30,27 @@ Automatic source configuration:  yes
 Shared playout delay:             120 ms
 Hard A/V deviation limit:         120 ms
 Video-stall hold threshold:       120 ms
-Baseline learning window:        1000 ms
-Drift analysis window:          30000 ms
-Minimum drift observation:      10000 ms
+Baseline learning window:        5000 ms
+Drift analysis window:         120000 ms
+Minimum drift observation:      30000 ms
 Drift deadband:                     8 ppm
 Gradual video correction:         yes
 Maximum video correction:          40 ms
 Video correction slew:           1000 ppm
-Atomic re-lock samples:            12
+Minimum recovery observations:     12
 NDI Frame Sync:                    off
 DistroAV sync mode:                Source Timecode
+NDI source behavior:               Keep Active
 ```
 
 ## States
 
 - `BYPASSED`: disabled or the source is not configured for Frame Sync off, Source Timecode, and audio enabled.
 - `WARMING UP`: collecting initial timing observations.
-- `RELOCKING`: gathering enough sane samples over the baseline learning window.
+- `VERIFYING`: quarantining recovery samples and comparing a stable candidate with the trusted reference.
+- `FAILED`: correction is bypassed because safe recovery could not be verified; normal DistroAV output remains live.
 - `LOCKED`: both paths are accepted on the shared playout timeline.
-- `HOLDING`: a discontinuity or unsafe timing state was detected and both paths are gated.
+- `HOLDING`: a discontinuity or unsafe timing state was detected; internal protected-timeline decisions pause while the adapter leaves normal DistroAV output live.
 
 ## Diagnostics
 
@@ -59,7 +62,7 @@ The dock reports raw and filtered skew, learned baseline, baseline sample count,
 - `av-governor-flight-recorder.csv`
 - a short explanation file
 
-The recorder is a fixed-size ring. Routine samples are rate-limited while holds, drops, locks, fades, resets, and corrections are recorded immediately.
+The recorder uses separate fixed-size rings. Holds, drops, locks, fades, resets, and failures use protected critical capacity. Routine samples and correction telemetry are rate-limited and cannot overwrite those critical events.
 
 ## Performance
 

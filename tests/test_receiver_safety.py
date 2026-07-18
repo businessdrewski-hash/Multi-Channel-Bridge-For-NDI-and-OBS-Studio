@@ -16,6 +16,9 @@ required_bridge = (
     "obs_source_set_audio_mixers(proxy, 0x3fU);",
     "bool force_reconnect()",
     'proc_handler_call(\n\t\t\tobs_source_get_proc_handler(source), "mcb_force_reconnect"',
+    'obs_data_set_int(settings, "ndi_behavior", 0)',
+    "matching_receiver_count",
+    "add_existing_source_to_current_scene",
 )
 for marker in required_bridge:
     if marker not in bridge:

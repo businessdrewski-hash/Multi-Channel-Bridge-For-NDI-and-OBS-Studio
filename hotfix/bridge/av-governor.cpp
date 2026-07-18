@@ -40,6 +40,17 @@ int64_t AVGovernor::median(std::array<int64_t, kBaselineCapacity> values, size_t
 	return values[middle - 1] / 2 + values[middle] / 2;
 }
 
+uint64_t AVGovernor::median_absolute_deviation(
+	std::array<int64_t, kBaselineCapacity> values, size_t count, int64_t center)
+{
+	if (!count)
+		return 0;
+	count = std::min(count, values.size());
+	for (size_t i = 0; i < count; ++i)
+		values[i] = static_cast<int64_t>(magnitude(values[i] - center));
+	return static_cast<uint64_t>(median(values, count));
+}
+
 int64_t AVGovernor::median_small(std::array<int64_t, kSkewFilterCapacity> values, size_t count)
 {
 	if (!count)
@@ -68,7 +79,8 @@ const char *AVGovernor::phase_name(AVGovernorPhase phase)
 	case AVGovernorPhase::WarmingUp: return "WARMING_UP";
 	case AVGovernorPhase::Locked: return "LOCKED";
 	case AVGovernorPhase::Holding: return "HOLDING";
-	case AVGovernorPhase::Relocking: return "RELOCKING";
+	case AVGovernorPhase::Verifying: return "VERIFYING";
+	case AVGovernorPhase::Failed: return "FAILED";
 	}
 	return "UNKNOWN";
 }
@@ -87,6 +99,8 @@ const char *AVGovernor::reason_name(AVGovernorReason reason)
 	case AVGovernorReason::PlayoutDepthExceeded: return "PLAYOUT_DEPTH_EXCEEDED";
 	case AVGovernorReason::SourceReconfigured: return "SOURCE_RECONFIGURED";
 	case AVGovernorReason::ManualReset: return "MANUAL_RESET";
+	case AVGovernorReason::BaselineMismatch: return "BASELINE_MISMATCH";
+	case AVGovernorReason::RecoveryLimit: return "RECOVERY_LIMIT";
 	}
 	return "UNKNOWN";
 }
@@ -101,6 +115,7 @@ const char *AVGovernor::event_name(EventType type)
 	case EventType::Drop: return "DROP";
 	case EventType::Reset: return "RESET";
 	case EventType::Fade: return "FADE";
+	case EventType::Failed: return "FAILED";
 	}
 	return "UNKNOWN";
 }
@@ -124,10 +139,10 @@ void AVGovernor::configure(bool enabled, int max_deviation_ms, int video_stall_m
 	max_video_correction_ns_ = ns_from_ms(std::clamp(max_video_correction_ms, 0, 120));
 	correction_slew_ppm_ = static_cast<uint32_t>(std::clamp(correction_slew_ppm, 50, 10000));
 	relock_required_ = static_cast<uint32_t>(std::clamp(relock_pairs, 3, 60));
-	baseline_window_ns_ = ns_from_ms(std::clamp(baseline_window_ms, 250, 5000));
-	const int bounded_drift_window_ms = std::clamp(drift_window_ms, 5000, 120000);
+	baseline_window_ns_ = ns_from_ms(std::clamp(baseline_window_ms, 5000, 30000));
+	const int bounded_drift_window_ms = std::clamp(drift_window_ms, 30000, 300000);
 	drift_window_ns_ = ns_from_ms(bounded_drift_window_ms);
-	drift_minimum_ns_ = ns_from_ms(std::clamp(drift_minimum_ms, 2000, bounded_drift_window_ms));
+	drift_minimum_ns_ = ns_from_ms(std::clamp(drift_minimum_ms, 30000, bounded_drift_window_ms));
 	drift_deadband_ppm_ = static_cast<uint32_t>(std::clamp(drift_deadband_ppm, 1, 250));
 	state_.relock_required = relock_required_;
 	state_.baseline_window_ns = baseline_window_ns_;
@@ -143,7 +158,7 @@ void AVGovernor::set_source_configured(bool configured)
 	if (state_.source_configured == configured)
 		return;
 	state_.source_configured = configured;
-	reset_locked(false, configured ? AVGovernorReason::Startup : AVGovernorReason::SourceReconfigured);
+	reset_locked(false, configured ? AVGovernorReason::Startup : AVGovernorReason::SourceReconfigured, true);
 }
 
 void AVGovernor::reset(bool reset_counters)
@@ -152,7 +167,7 @@ void AVGovernor::reset(bool reset_counters)
 	reset_locked(reset_counters, AVGovernorReason::ManualReset);
 }
 
-void AVGovernor::reset_locked(bool reset_counters, AVGovernorReason reason)
+void AVGovernor::reset_locked(bool reset_counters, AVGovernorReason reason, bool preserve_trusted_baseline)
 {
 	const bool enabled = state_.enabled;
 	const bool configured = state_.source_configured;
@@ -165,11 +180,15 @@ void AVGovernor::reset_locked(bool reset_counters, AVGovernorReason reason)
 	const uint64_t discontinuities = reset_counters ? 0 : state_.discontinuities;
 	const uint64_t lock_acquisitions = reset_counters ? 0 : state_.lock_acquisitions;
 	const uint64_t recoveries = reset_counters ? 0 : state_.atomic_recoveries;
+	const uint64_t failed_recoveries = reset_counters ? 0 : state_.failed_recoveries;
+	const uint64_t quarantined_samples = reset_counters ? 0 : state_.quarantined_samples;
 	const uint64_t correction_updates = reset_counters ? 0 : state_.correction_updates;
 	const uint64_t monotonic_clamps = reset_counters ? 0 : state_.monotonic_clamps;
 	const uint64_t fade_out_packets = reset_counters ? 0 : state_.fade_out_packets;
 	const uint64_t fade_in_packets = reset_counters ? 0 : state_.fade_in_packets;
 	const uint64_t epoch = reset_counters ? 0 : state_.epoch + 1;
+	const bool trusted_baseline_valid = preserve_trusted_baseline && state_.baseline_valid;
+	const int64_t trusted_baseline = trusted_baseline_valid ? state_.baseline_skew_ns : 0;
 
 	state_ = {};
 	state_.enabled = enabled;
@@ -186,15 +205,22 @@ void AVGovernor::reset_locked(bool reset_counters, AVGovernorReason reason)
 	state_.discontinuities = discontinuities;
 	state_.lock_acquisitions = lock_acquisitions;
 	state_.atomic_recoveries = recoveries;
+	state_.failed_recoveries = failed_recoveries;
+	state_.quarantined_samples = quarantined_samples;
 	state_.correction_updates = correction_updates;
 	state_.monotonic_clamps = monotonic_clamps;
 	state_.fade_out_packets = fade_out_packets;
 	state_.fade_in_packets = fade_in_packets;
 	state_.epoch = epoch;
+	state_.baseline_valid = trusted_baseline_valid;
+	state_.baseline_skew_ns = trusted_baseline;
+	state_.verifying_trusted_baseline = trusted_baseline_valid && enabled && configured;
 	state_.last_output_audio_ns = last_output_audio_ns_;
 	state_.last_output_video_ns = last_output_video_ns_;
 	state_.relock_required = relock_required_;
-	state_.phase = enabled && configured ? AVGovernorPhase::WarmingUp : AVGovernorPhase::Bypassed;
+	state_.phase = enabled && configured
+		? trusted_baseline_valid ? AVGovernorPhase::Verifying : AVGovernorPhase::WarmingUp
+		: AVGovernorPhase::Bypassed;
 	state_.reason = enabled && configured ? reason : AVGovernorReason::None;
 
 	audio_sequence_ = 0;
@@ -202,6 +228,13 @@ void AVGovernor::reset_locked(bool reset_counters, AVGovernorReason reason)
 	paired_audio_sequence_ = 0;
 	paired_video_sequence_ = 0;
 	baseline_start_arrival_ns_ = 0;
+	quarantine_until_ns_ = 0;
+	stable_lock_start_ns_ = 0;
+	recovery_window_start_ns_ = 0;
+	recovery_attempts_ = 0;
+	acquiring_initial_baseline_ = !trusted_baseline_valid;
+	start_quarantine_on_next_pair_ = trusted_baseline_valid && enabled && configured;
+	drift_confirmed_ = false;
 	baseline_count_ = 0;
 	skew_filter_write_ = 0;
 	skew_filter_count_ = 0;
@@ -213,9 +246,14 @@ void AVGovernor::reset_locked(bool reset_counters, AVGovernorReason reason)
 	previous_video_for_interval_ns_ = 0;
 	fade_in_pending_ = false;
 	last_record_sample_ns_ = 0;
+	last_record_correction_ns_ = 0;
+	last_recorded_correction_ns_ = 0;
+	last_recorded_target_ns_ = 0;
 	if (reset_counters) {
-		event_write_ = 0;
-		event_count_ = 0;
+		critical_write_ = 0;
+		critical_count_ = 0;
+		telemetry_write_ = 0;
+		telemetry_count_ = 0;
 	}
 	record_locked(EventType::Reset, Stream::Audio, false, 0, 0, 0, 0, 0, true);
 }
@@ -224,17 +262,32 @@ void AVGovernor::enter_hold_locked(AVGovernorReason reason, uint64_t arrival_ns)
 {
 	++state_.discontinuities;
 	++state_.epoch;
+	if (!recovery_window_start_ns_ || arrival_ns < recovery_window_start_ns_ ||
+		arrival_ns - recovery_window_start_ns_ > recovery_limit_window_ns_) {
+		recovery_window_start_ns_ = arrival_ns;
+		recovery_attempts_ = 0;
+	}
+	if (stable_lock_start_ns_ && arrival_ns >= stable_lock_start_ns_ &&
+		arrival_ns - stable_lock_start_ns_ > recovery_limit_window_ns_)
+		recovery_attempts_ = 0;
+	++recovery_attempts_;
+	if (recovery_attempts_ > 3) {
+		enter_failed_locked(AVGovernorReason::RecoveryLimit, arrival_ns);
+		return;
+	}
 	state_.phase = AVGovernorPhase::Holding;
 	state_.reason = reason;
 	state_.locked = false;
 	state_.video_stalled = reason == AVGovernorReason::VideoStall;
-	state_.baseline_valid = false;
+	state_.fail_safe_bypassed = false;
+	state_.verifying_trusted_baseline = state_.baseline_valid;
 	state_.raw_av_skew_ns = 0;
 	state_.av_skew_ns = 0;
-	state_.baseline_skew_ns = 0;
+	state_.candidate_baseline_skew_ns = 0;
 	state_.baseline_deviation_ns = 0;
 	state_.video_correction_ns = 0;
 	state_.target_video_correction_ns = 0;
+	state_.correction_limited = false;
 	state_.drift_ppm = 0;
 	state_.drift_confidence = 0;
 	state_.epoch_rebase_ns = 0;
@@ -249,14 +302,38 @@ void AVGovernor::enter_hold_locked(AVGovernorReason reason, uint64_t arrival_ns)
 	video_sequence_ = 0;
 	paired_audio_sequence_ = 0;
 	paired_video_sequence_ = 0;
-	baseline_start_arrival_ns_ = arrival_ns;
+	quarantine_until_ns_ = arrival_ns <= std::numeric_limits<uint64_t>::max() - quarantine_ns_
+		? arrival_ns + quarantine_ns_
+		: arrival_ns;
+	baseline_start_arrival_ns_ = quarantine_until_ns_;
 	baseline_count_ = 0;
+	acquiring_initial_baseline_ = !state_.baseline_valid;
+	drift_confirmed_ = false;
+	stable_lock_start_ns_ = 0;
 	skew_filter_write_ = 0;
 	skew_filter_count_ = 0;
 	trend_write_ = 0;
 	trend_count_ = 0;
 	last_trend_sample_ns_ = 0;
 	fade_in_pending_ = true;
+}
+
+void AVGovernor::enter_failed_locked(AVGovernorReason reason, uint64_t arrival_ns)
+{
+	state_.phase = AVGovernorPhase::Failed;
+	state_.reason = reason;
+	state_.locked = false;
+	state_.fail_safe_bypassed = true;
+	state_.verifying_trusted_baseline = false;
+	state_.video_correction_ns = 0;
+	state_.target_video_correction_ns = 0;
+	state_.correction_limited = false;
+	state_.drift_ppm = 0;
+	state_.drift_confidence = 0;
+	++state_.failed_recoveries;
+	record_locked(EventType::Failed, Stream::Video, false, state_.last_video_source_ns,
+		arrival_ns, 0, state_.last_video_ndi_timestamp_100ns,
+		state_.last_video_ndi_timecode_100ns, true);
 }
 
 void AVGovernor::update_skew_locked()
@@ -295,11 +372,16 @@ bool AVGovernor::observe_pair_locked(uint64_t arrival_ns)
 	paired_audio_sequence_ = audio_sequence_;
 	paired_video_sequence_ = video_sequence_;
 	update_skew_locked();
+	if (state_.phase == AVGovernorPhase::Failed) {
+		push_skew_filter_locked(state_.raw_av_skew_ns);
+		return false;
+	}
 	if (magnitude(state_.raw_av_skew_ns) > acquisition_limit_ns_) {
 		baseline_count_ = 0;
 		baseline_start_arrival_ns_ = arrival_ns;
 		state_.relock_progress = 0;
 		state_.baseline_samples = 0;
+		++state_.quarantined_samples;
 		return false;
 	}
 	push_skew_filter_locked(state_.raw_av_skew_ns);
@@ -309,7 +391,19 @@ bool AVGovernor::observe_pair_locked(uint64_t arrival_ns)
 		return false;
 	}
 
-	state_.phase = AVGovernorPhase::Relocking;
+	if (start_quarantine_on_next_pair_) {
+		quarantine_until_ns_ = arrival_ns <= std::numeric_limits<uint64_t>::max() - quarantine_ns_
+			? arrival_ns + quarantine_ns_
+			: arrival_ns;
+		baseline_start_arrival_ns_ = quarantine_until_ns_;
+		start_quarantine_on_next_pair_ = false;
+	}
+	if (quarantine_until_ns_ && arrival_ns < quarantine_until_ns_) {
+		++state_.quarantined_samples;
+		return false;
+	}
+	state_.phase = state_.baseline_valid ? AVGovernorPhase::Verifying : AVGovernorPhase::WarmingUp;
+	state_.verifying_trusted_baseline = state_.baseline_valid;
 	if (!baseline_start_arrival_ns_)
 		baseline_start_arrival_ns_ = arrival_ns;
 	if (baseline_count_ < baseline_samples_.size()) {
@@ -327,24 +421,49 @@ bool AVGovernor::observe_pair_locked(uint64_t arrival_ns)
 	if (baseline_count_ < relock_required_ || elapsed < baseline_window_ns_)
 		return false;
 
-	state_.baseline_skew_ns = median(baseline_samples_, baseline_count_);
+	const int64_t candidate = median(baseline_samples_, baseline_count_);
+	state_.candidate_baseline_skew_ns = candidate;
+	const uint64_t instability = median_absolute_deviation(baseline_samples_, baseline_count_, candidate);
+	if (instability > baseline_stability_limit_ns_) {
+		baseline_count_ = 0;
+		baseline_start_arrival_ns_ = arrival_ns;
+		state_.relock_progress = 0;
+		state_.baseline_samples = 0;
+		++state_.quarantined_samples;
+		return false;
+	}
+
+	if (state_.baseline_valid) {
+		if (magnitude(candidate - state_.baseline_skew_ns) > recovery_match_limit_ns_) {
+			state_.baseline_deviation_ns = candidate - state_.baseline_skew_ns;
+			enter_failed_locked(AVGovernorReason::BaselineMismatch, arrival_ns);
+			return false;
+		}
+	} else {
+		state_.baseline_skew_ns = candidate;
+		state_.baseline_valid = true;
+	}
 	state_.baseline_deviation_ns = state_.av_skew_ns - state_.baseline_skew_ns;
-	state_.baseline_valid = true;
 	state_.locked = true;
+	state_.fail_safe_bypassed = false;
+	state_.verifying_trusted_baseline = false;
 	state_.video_stalled = false;
 	state_.phase = AVGovernorPhase::Locked;
 	state_.reason = AVGovernorReason::None;
 	state_.relock_progress = relock_required_;
 	state_.video_correction_ns = 0;
 	state_.target_video_correction_ns = 0;
+	state_.correction_limited = false;
 	state_.drift_ppm = 0;
 	state_.drift_confidence = 0;
+	drift_confirmed_ = false;
 	trend_write_ = 0;
 	trend_count_ = 0;
 	last_trend_sample_ns_ = 0;
 	establish_epoch_mapping_locked();
 	const bool recovering = state_.lock_acquisitions > 0;
 	++state_.lock_acquisitions;
+	stable_lock_start_ns_ = arrival_ns;
 	if (recovering) {
 		++state_.atomic_recoveries;
 		fade_in_pending_ = true;
@@ -459,16 +578,22 @@ void AVGovernor::update_video_correction_locked()
 	if (!state_.drift_correction_enabled || !state_.baseline_valid) {
 		state_.target_video_correction_ns = 0;
 		state_.video_correction_ns = 0;
+		state_.correction_limited = false;
+		drift_confirmed_ = false;
 		return;
 	}
 
-	const bool confirmed = state_.drift_confidence >= 70 &&
-		magnitude(state_.drift_ppm) >= static_cast<uint64_t>(drift_deadband_ppm_);
+	const uint64_t ppm = magnitude(state_.drift_ppm);
+	if (!drift_confirmed_)
+		drift_confirmed_ = state_.drift_confidence >= 75 && ppm >= drift_deadband_ppm_;
+	else if (state_.drift_confidence < 55 || ppm < std::max<uint32_t>(1, drift_deadband_ppm_ / 2))
+		drift_confirmed_ = false;
 	constexpr int64_t offset_deadband_ns = 2000000LL;
-	int64_t target = confirmed && magnitude(state_.baseline_deviation_ns) > static_cast<uint64_t>(offset_deadband_ns)
+	int64_t target = drift_confirmed_ && magnitude(state_.baseline_deviation_ns) > static_cast<uint64_t>(offset_deadband_ns)
 		? state_.baseline_deviation_ns
 		: 0;
 	const int64_t limit = static_cast<int64_t>(max_video_correction_ns_);
+	state_.correction_limited = magnitude(target) > static_cast<uint64_t>(std::max<int64_t>(limit, 0));
 	target = std::clamp(target, -limit, limit);
 	state_.target_video_correction_ns = target;
 
@@ -597,6 +722,22 @@ AVGovernorDecision AVGovernor::process_locked(Stream stream, uint64_t source_ns,
 			ndi_timestamp_100ns, ndi_timecode_100ns, true);
 		return {false, 0, 1.0f, 1.0f};
 	}
+	if (state_.phase == AVGovernorPhase::Failed) {
+		if (stream == Stream::Audio) {
+			state_.last_audio_source_ns = source_ns;
+			state_.last_audio_arrival_ns = arrival_ns;
+			++audio_sequence_;
+		} else {
+			update_video_interval_locked(source_ns);
+			state_.last_video_source_ns = source_ns;
+			state_.last_video_arrival_ns = arrival_ns;
+			++video_sequence_;
+		}
+		observe_pair_locked(arrival_ns);
+		record_locked(EventType::Sample, stream, false, source_ns, arrival_ns, 0,
+			ndi_timestamp_100ns, ndi_timecode_100ns, false);
+		return {false, 0, 1.0f, 1.0f};
+	}
 
 	const uint64_t previous_source = stream == Stream::Audio
 		? state_.last_audio_source_ns
@@ -716,7 +857,7 @@ AVGovernorSnapshot AVGovernor::snapshot() const
 {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto copy = state_;
-	copy.recorder_events = static_cast<uint32_t>(event_count_);
+	copy.recorder_events = static_cast<uint32_t>(critical_count_ + telemetry_count_);
 	return copy;
 }
 
@@ -724,12 +865,28 @@ void AVGovernor::record_locked(EventType type, Stream stream, bool accepted, uin
 	uint64_t arrival_ns, uint64_t output_ns, int64_t ndi_timestamp_100ns,
 	int64_t ndi_timecode_100ns, bool force)
 {
-	constexpr uint64_t sample_interval_ns = 100000000ULL;
-	if (!force && type == EventType::Sample && last_record_sample_ns_ && arrival_ns >= last_record_sample_ns_ &&
-		arrival_ns - last_record_sample_ns_ < sample_interval_ns)
-		return;
-	if (arrival_ns)
+	constexpr uint64_t telemetry_interval_ns = 1000000000ULL;
+	constexpr uint64_t material_correction_ns = 1000000ULL;
+	const bool critical = type == EventType::Hold || type == EventType::Lock ||
+		type == EventType::Reset || type == EventType::Fade || type == EventType::Failed ||
+		(force && type == EventType::Drop);
+	if (!critical && type == EventType::Correction) {
+		const bool interval_elapsed = !last_record_correction_ns_ || arrival_ns < last_record_correction_ns_ ||
+			arrival_ns - last_record_correction_ns_ >= telemetry_interval_ns;
+		const bool material_change = magnitude(state_.video_correction_ns - last_recorded_correction_ns_) >=
+			material_correction_ns ||
+			magnitude(state_.target_video_correction_ns - last_recorded_target_ns_) >= material_correction_ns;
+		if (!interval_elapsed && !material_change)
+			return;
+		last_record_correction_ns_ = arrival_ns;
+		last_recorded_correction_ns_ = state_.video_correction_ns;
+		last_recorded_target_ns_ = state_.target_video_correction_ns;
+	} else if (!critical) {
+		if (last_record_sample_ns_ && arrival_ns >= last_record_sample_ns_ &&
+			arrival_ns - last_record_sample_ns_ < telemetry_interval_ns)
+			return;
 		last_record_sample_ns_ = arrival_ns;
+	}
 
 	Event event;
 	event.arrival_ns = arrival_ns;
@@ -742,6 +899,8 @@ void AVGovernor::record_locked(EventType type, Stream stream, bool accepted, uin
 	event.raw_ndi_timecode_100ns = ndi_timecode_100ns;
 	event.raw_skew_ns = state_.raw_av_skew_ns;
 	event.skew_ns = state_.av_skew_ns;
+	event.trusted_baseline_ns = state_.baseline_skew_ns;
+	event.candidate_baseline_ns = state_.candidate_baseline_skew_ns;
 	event.deviation_ns = state_.baseline_deviation_ns;
 	event.correction_ns = state_.video_correction_ns;
 	event.rebase_ns = state_.epoch_rebase_ns;
@@ -755,9 +914,16 @@ void AVGovernor::record_locked(EventType type, Stream stream, bool accepted, uin
 	event.type = type;
 	event.stream = stream;
 	event.accepted = accepted;
-	events_[event_write_] = event;
-	event_write_ = (event_write_ + 1) % kRecorderCapacity;
-	event_count_ = std::min(event_count_ + 1, kRecorderCapacity);
+	event.fail_safe_bypassed = state_.fail_safe_bypassed;
+	if (critical) {
+		critical_events_[critical_write_] = event;
+		critical_write_ = (critical_write_ + 1) % kCriticalRecorderCapacity;
+		critical_count_ = std::min(critical_count_ + 1, kCriticalRecorderCapacity);
+	} else {
+		telemetry_events_[telemetry_write_] = event;
+		telemetry_write_ = (telemetry_write_ + 1) % kTelemetryRecorderCapacity;
+		telemetry_count_ = std::min(telemetry_count_ + 1, kTelemetryRecorderCapacity);
+	}
 }
 
 std::string AVGovernor::flight_recorder_csv() const
@@ -766,10 +932,15 @@ std::string AVGovernor::flight_recorder_csv() const
 	std::ostringstream out;
 	out << "arrival_ns,source_ns,output_ns,ndi_timestamp_100ns,ndi_timecode_100ns,epoch,"
 		"audio_seq,video_seq,stream,event,accepted,phase,reason,raw_skew_ms,filtered_skew_ms,"
-		"deviation_ms,drift_ppm,drift_confidence,playout_depth_ms,video_correction_ms,epoch_rebase_ms\n";
-	const size_t begin = (event_write_ + kRecorderCapacity - event_count_) % kRecorderCapacity;
-	for (size_t i = 0; i < event_count_; ++i) {
-		const Event &event = events_[(begin + i) % kRecorderCapacity];
+		"trusted_baseline_ms,candidate_baseline_ms,deviation_ms,drift_ppm,drift_confidence,"
+		"playout_depth_ms,video_correction_ms,clock_domain_offset_ms,fail_safe_bypassed\n";
+	const size_t critical_begin = (critical_write_ + kCriticalRecorderCapacity - critical_count_) %
+		kCriticalRecorderCapacity;
+	const size_t telemetry_begin = (telemetry_write_ + kTelemetryRecorderCapacity - telemetry_count_) %
+		kTelemetryRecorderCapacity;
+	size_t critical_index = 0;
+	size_t telemetry_index = 0;
+	auto write_event = [&out](const Event &event) {
 		out << event.arrival_ns << ',' << event.source_ns << ',' << event.output_ns << ','
 			<< event.raw_ndi_timestamp_100ns << ',' << event.raw_ndi_timecode_100ns << ','
 			<< event.epoch << ',' << event.audio_sequence << ',' << event.video_sequence << ','
@@ -778,11 +949,29 @@ std::string AVGovernor::flight_recorder_csv() const
 			<< reason_name(event.reason) << ','
 			<< static_cast<double>(event.raw_skew_ns) / 1000000.0 << ','
 			<< static_cast<double>(event.skew_ns) / 1000000.0 << ','
+			<< static_cast<double>(event.trusted_baseline_ns) / 1000000.0 << ','
+			<< static_cast<double>(event.candidate_baseline_ns) / 1000000.0 << ','
 			<< static_cast<double>(event.deviation_ns) / 1000000.0 << ','
 			<< event.drift_ppm << ',' << event.drift_confidence << ','
 			<< static_cast<double>(event.playout_depth_ns) / 1000000.0 << ','
 			<< static_cast<double>(event.correction_ns) / 1000000.0 << ','
-			<< static_cast<double>(event.rebase_ns) / 1000000.0 << '\n';
+			<< static_cast<double>(event.rebase_ns) / 1000000.0 << ','
+			<< (event.fail_safe_bypassed ? 1 : 0) << '\n';
+	};
+	while (critical_index < critical_count_ || telemetry_index < telemetry_count_) {
+		const Event *critical = critical_index < critical_count_
+			? &critical_events_[(critical_begin + critical_index) % kCriticalRecorderCapacity]
+			: nullptr;
+		const Event *telemetry = telemetry_index < telemetry_count_
+			? &telemetry_events_[(telemetry_begin + telemetry_index) % kTelemetryRecorderCapacity]
+			: nullptr;
+		if (critical && (!telemetry || critical->arrival_ns <= telemetry->arrival_ns)) {
+			write_event(*critical);
+			++critical_index;
+		} else if (telemetry) {
+			write_event(*telemetry);
+			++telemetry_index;
+		}
 	}
 	return out.str();
 }

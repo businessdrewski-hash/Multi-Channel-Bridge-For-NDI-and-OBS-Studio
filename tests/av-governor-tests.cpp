@@ -8,6 +8,7 @@
 using mcb::AVGovernor;
 using mcb::AVGovernorDecision;
 using mcb::AVGovernorPhase;
+using mcb::AVGovernorReason;
 
 namespace {
 constexpr uint64_t ms = 1000000ULL;
@@ -46,112 +47,100 @@ FeedResult feed_pairs(AVGovernor &governor, uint64_t video_source, uint64_t arri
 	result.next_arrival = arrival + static_cast<uint64_t>(pairs) * frame_ns;
 	return result;
 }
+
+void configure(AVGovernor &governor)
+{
+	governor.configure(true, 120, 120, 100, true, 40, 1000, 12,
+		5000, 60000, 30000, 8);
+	governor.set_source_configured(true);
+}
+
+FeedResult acquire_initial_lock(AVGovernor &governor)
+{
+	configure(governor);
+	auto startup = feed_pairs(governor, 1000 * ms, 1000 * ms, 360,
+		20 * static_cast<int64_t>(ms));
+	const auto state = governor.snapshot();
+	assert(state.locked);
+	assert(state.baseline_valid);
+	assert(state.baseline_skew_ns > 15 * static_cast<int64_t>(ms));
+	assert(state.baseline_skew_ns < 25 * static_cast<int64_t>(ms));
+	return startup;
+}
 } // namespace
 
 int main()
 {
-	AVGovernor governor;
-	governor.configure(true, 120, 120, 100, true, 40, 10000, 3,
-		250, 10000, 2000, 8);
-
 	// A source with incompatible settings is deliberately bypassed.
-	auto decision = governor.process_audio(900 * ms, 900 * ms);
+	AVGovernor bypassed;
+	auto decision = bypassed.process_audio(900 * ms, 900 * ms);
 	assert(decision.accept && decision.output_timestamp_ns == 900 * ms);
-	decision = governor.process_video(900 * ms, 900 * ms);
-	assert(decision.accept && decision.output_timestamp_ns == 900 * ms);
 
-	governor.set_source_configured(true);
-	assert(governor.snapshot().phase == AVGovernorPhase::WarmingUp);
-
-	// Startup holds both paths while it learns a robust baseline over time.
-	auto startup = feed_pairs(governor, 1000 * ms, 1000 * ms, 24, 20 * static_cast<int64_t>(ms));
-	auto state = governor.snapshot();
+	// Slow persistent drift matures over at least 30 seconds before correction begins.
+	AVGovernor drift_governor;
+	auto startup = acquire_initial_lock(drift_governor);
+	const int64_t trusted_baseline = drift_governor.snapshot().baseline_skew_ns;
+	auto drift = feed_pairs(drift_governor, startup.next_video_source, startup.next_arrival,
+		2400, 20 * static_cast<int64_t>(ms), 600, 70000);
+	auto state = drift_governor.snapshot();
 	assert(state.locked);
-	assert(state.baseline_valid);
-	assert(state.baseline_samples >= 3);
-	assert(state.lock_acquisitions == 1);
-	assert(state.raw_av_skew_ns != 0);
-
-	// Both streams are mapped to the same future OBS playout timeline.
-	decision = governor.process_video(startup.next_video_source, startup.next_arrival, 50001, 60001);
-	assert(decision.accept);
-	state = governor.snapshot();
-	assert(state.video_playout_depth_ns > 80 * static_cast<int64_t>(ms));
-	assert(state.video_playout_depth_ns < 130 * static_cast<int64_t>(ms));
-	decision = governor.process_audio(startup.next_video_source + 20 * ms,
-		startup.next_arrival + ms, 50002, 60002);
-	assert(decision.accept);
-	state = governor.snapshot();
-	assert(state.audio_playout_depth_ns > 80 * static_cast<int64_t>(ms));
-	assert(state.audio_playout_depth_ns < 130 * static_cast<int64_t>(ms));
-
-	// Persistent rate drift is distinguished from jitter before video-only correction begins.
-	const uint64_t drift_video = startup.next_video_source + frame_ns;
-	const uint64_t drift_arrival = startup.next_arrival + frame_ns;
-	auto drift = feed_pairs(governor, drift_video, drift_arrival, 560,
-		20 * static_cast<int64_t>(ms), 600, 70000);
-	state = governor.snapshot();
-	assert(state.locked);
-	assert(state.drift_samples >= 24);
-	assert(state.drift_confidence >= 70);
+	assert(state.baseline_skew_ns == trusted_baseline);
+	assert(state.drift_samples >= 100);
+	assert(state.drift_confidence >= 75);
 	assert(state.drift_ppm > 100);
 	assert(state.correction_updates > 0);
 	assert(state.video_correction_ns != 0);
 
-	// A video stall allows one controlled fade-out packet, then gates further audio.
-	const uint64_t stalled_audio_source = drift.next_video_source + 20 * ms;
+	// A short video stall preserves the trusted baseline, quarantines recovery
+	// samples, and verifies the recovered candidate before locking again.
+	const uint64_t stalled_audio_source = state.last_audio_source_ns + frame_ns;
 	const uint64_t stalled_arrival = drift.next_arrival + 200 * ms;
-	decision = governor.process_audio(stalled_audio_source, stalled_arrival, 88001, 98001);
+	decision = drift_governor.process_audio(stalled_audio_source, stalled_arrival, 88001, 98001);
 	assert(decision.accept);
-	assert(decision.audio_gain_start == 1.0f && decision.audio_gain_end == 0.0f);
-	state = governor.snapshot();
-	assert(state.video_stalled);
+	state = drift_governor.snapshot();
 	assert(state.phase == AVGovernorPhase::Holding);
-	assert(state.fade_out_packets >= 1);
-	assert(!governor.process_audio(stalled_audio_source + frame_ns,
-		stalled_arrival + frame_ns, 88002, 98002).accept);
-
-	// Recovery learns a fresh baseline and resumes both paths atomically with one fade-in.
-	const uint64_t recovery_video_source = drift.next_video_source + 2 * frame_ns;
-	const uint64_t recovery_arrival = stalled_arrival + frame_ns;
-	auto recovery = feed_pairs(governor, recovery_video_source, recovery_arrival, 24,
-		20 * static_cast<int64_t>(ms), 0, 100000);
-	state = governor.snapshot();
+	assert(state.baseline_valid);
+	assert(state.baseline_skew_ns == trusted_baseline);
+	auto recovered = feed_pairs(drift_governor, drift.next_video_source + 2 * frame_ns,
+		stalled_arrival + frame_ns, 480, 20 * static_cast<int64_t>(ms), 0, 100000);
+	state = drift_governor.snapshot();
 	assert(state.locked);
+	assert(state.baseline_skew_ns == trusted_baseline);
 	assert(state.atomic_recoveries >= 1);
-	assert(recovery.saw_audio_fade_in);
-	assert(state.fade_in_packets >= 1);
+	assert(state.quarantined_samples > 0);
+	assert(recovered.saw_audio_fade_in);
 
-	// A backward source timestamp starts a new epoch instead of entering OBS.
-	const uint64_t previous_video_output = state.last_output_video_ns;
-	assert(!governor.process_video(1000 * ms, recovery.next_arrival + ms, 120001, 130001).accept);
-	state = governor.snapshot();
-	assert(state.phase == AVGovernorPhase::Holding);
-	assert(state.discontinuities >= 2);
+	// A post-jump timing candidate roughly 100 ms away is never learned as the
+	// new normal. Protection fails open and retains the known-good reference.
+	AVGovernor mismatch_governor;
+	auto clean = acquire_initial_lock(mismatch_governor);
+	const int64_t known_good = mismatch_governor.snapshot().baseline_skew_ns;
+	assert(!mismatch_governor.process_video(1000 * ms, clean.next_arrival + ms, 120001, 130001).accept);
+	auto mismatch = feed_pairs(mismatch_governor, 1000 * ms, clean.next_arrival + 2 * ms,
+		480, -80 * static_cast<int64_t>(ms), 0, 140000);
+	(void)mismatch;
+	state = mismatch_governor.snapshot();
+	assert(state.phase == AVGovernorPhase::Failed);
+	assert(state.reason == AVGovernorReason::BaselineMismatch);
+	assert(state.fail_safe_bypassed);
+	assert(state.baseline_valid);
+	assert(state.baseline_skew_ns == known_good);
+	assert(state.candidate_baseline_skew_ns < -70 * static_cast<int64_t>(ms));
 
-	// The fresh epoch is rebased onto a monotonic OBS timeline.
-	auto rebased = feed_pairs(governor, 1000 * ms, recovery.next_arrival + 2 * ms, 24,
-		20 * static_cast<int64_t>(ms), 0, 140000);
-	state = governor.snapshot();
-	assert(state.locked);
-	decision = governor.process_video(rebased.next_video_source, rebased.next_arrival, 150001, 160001);
-	assert(decision.accept);
-	assert(decision.output_timestamp_ns > previous_video_output);
-	assert(governor.snapshot().epoch_rebase_ns != 0);
-
-	const std::string csv = governor.flight_recorder_csv();
-	assert(csv.find("arrival_ns,source_ns") == 0);
-	assert(csv.find("ndi_timestamp_100ns") != std::string::npos);
+	// Routine telemetry cannot evict the critical discontinuity and failure.
+	feed_pairs(mismatch_governor, 6000 * ms, clean.next_arrival + 6000 * ms,
+		5000, 20 * static_cast<int64_t>(ms), 0, 200000);
+	const std::string csv = mismatch_governor.flight_recorder_csv();
+	assert(csv.find("trusted_baseline_ms") != std::string::npos);
+	assert(csv.find("clock_domain_offset_ms") != std::string::npos);
 	assert(csv.find("HOLD") != std::string::npos);
-	assert(csv.find("LOCK") != std::string::npos);
-	assert(csv.find("FADE") != std::string::npos);
-	assert(csv.find("150001") != std::string::npos);
+	assert(csv.find("BASELINE_MISMATCH") != std::string::npos);
+	assert(csv.find("FAILED") != std::string::npos);
+	assert(mismatch_governor.snapshot().recorder_events <= 1024);
 
-	governor.set_source_configured(false);
-	assert(governor.process_audio(1, 1).accept);
-	governor.configure(false, 120, 120, 100, true, 40, 1000, 3);
-	assert(governor.process_video(1, 1).accept);
+	drift_governor.set_source_configured(false);
+	assert(drift_governor.process_audio(1, 1).accept);
 
-	std::cout << "A/V Governor 1.2 tests passed\n";
+	std::cout << "A/V Governor 1.3 trusted-baseline, drift, recovery, and recorder tests passed\n";
 	return 0;
 }

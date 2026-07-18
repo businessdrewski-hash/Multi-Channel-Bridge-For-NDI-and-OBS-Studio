@@ -24,6 +24,7 @@
 #include <QGroupBox>
 #include <QHideEvent>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -35,7 +36,9 @@
 #include <QShowEvent>
 #include <QSpinBox>
 #include <QString>
+#include <QStringList>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -53,8 +56,8 @@ constexpr const char *kSection = "NDIMultichannelBridge";
 constexpr const char *kDockId = "distroav_multichannel_bridge_v030";
 constexpr const char *kProgramSourceId = "ndi_multichannel_bridge_program_audio";
 constexpr const char *kMicSourceId = "ndi_multichannel_bridge_mic_audio";
-constexpr const char *kVersion = "0.5.0-alpha1-buildfix2";
-constexpr const char *kGovernorVersion = "1.2";
+constexpr const char *kVersion = "0.5.1-alpha1";
+constexpr const char *kGovernorVersion = "1.3";
 constexpr const char *kSenderCoreVersion = "2.0";
 constexpr const char *kDefaultProgramName = "MCB Desktop / Game";
 constexpr const char *kDefaultMicName = "MCB Microphone";
@@ -66,7 +69,8 @@ const char *governor_phase_name(mcb::AVGovernorPhase phase)
 	case mcb::AVGovernorPhase::WarmingUp: return "WARMING UP";
 	case mcb::AVGovernorPhase::Locked: return "LOCKED";
 	case mcb::AVGovernorPhase::Holding: return "HOLDING";
-	case mcb::AVGovernorPhase::Relocking: return "RELOCKING";
+	case mcb::AVGovernorPhase::Verifying: return "VERIFYING";
+	case mcb::AVGovernorPhase::Failed: return "NEEDS ATTENTION";
 	}
 	return "UNKNOWN";
 }
@@ -85,6 +89,8 @@ const char *governor_reason_name(mcb::AVGovernorReason reason)
 	case mcb::AVGovernorReason::PlayoutDepthExceeded: return "shared playout depth left safe range";
 	case mcb::AVGovernorReason::SourceReconfigured: return "source timing changed";
 	case mcb::AVGovernorReason::ManualReset: return "manual reset";
+	case mcb::AVGovernorReason::BaselineMismatch: return "recovered timing did not match the trusted reference";
+	case mcb::AVGovernorReason::RecoveryLimit: return "too many recoveries in a short period";
 	}
 	return "unknown";
 }
@@ -140,9 +146,9 @@ void ensure_defaults()
 	config_set_default_int(config, kSection, "GovernorMaxVideoCorrectionMs", 40);
 	config_set_default_int(config, kSection, "GovernorCorrectionSlewPpm", 1000);
 	config_set_default_int(config, kSection, "GovernorRelockPairs", 12);
-	config_set_default_int(config, kSection, "GovernorBaselineWindowMs", 1000);
-	config_set_default_int(config, kSection, "GovernorDriftWindowMs", 30000);
-	config_set_default_int(config, kSection, "GovernorDriftMinimumMs", 10000);
+	config_set_default_int(config, kSection, "GovernorBaselineWindowMs", 5000);
+	config_set_default_int(config, kSection, "GovernorDriftWindowMs", 120000);
+	config_set_default_int(config, kSection, "GovernorDriftMinimumMs", 30000);
 	config_set_default_int(config, kSection, "GovernorDriftDeadbandPpm", 8);
 }
 
@@ -309,12 +315,12 @@ public:
 		obs_data_set_bool(settings, "ndi_framesync", false);
 		obs_data_set_int(settings, "ndi_sync", 2);
 		obs_data_set_bool(settings, "ndi_audio", true);
+		obs_data_set_int(settings, "ndi_behavior", 0); // Keep the canonical receiver active across scenes.
 		obs_source_update(source, settings);
 		obs_data_release(settings);
 		obs_source_release(source);
 		const bool reconnect_requested = force_reconnect();
 		governor_.set_source_configured(true);
-		governor_.reset(false);
 		obs_log(LOG_INFO,
 			"[multichannel-bridge] Applied recommended source timing and requested receiver reconnect: %s",
 			reconnect_requested ? "yes" : "procedure unavailable");
@@ -340,7 +346,8 @@ public:
 		calldata_free(&params);
 		obs_source_release(source);
 		if (accepted) {
-			reset_governor(false);
+			governor_.set_source_configured(false);
+			governor_.set_source_configured(true);
 			obs_log(LOG_INFO, "[multichannel-bridge] Requested an in-place DistroAV receiver reconnect");
 		}
 		return accepted;
@@ -710,6 +717,82 @@ std::vector<std::string> list_ndi_audio_sources()
 	return names;
 }
 
+std::string ndi_sender_for_source(obs_source_t *source)
+{
+	if (!source)
+		return {};
+	obs_data_t *settings = obs_source_get_settings(source);
+	const char *sender = settings ? obs_data_get_string(settings, "ndi_source_name") : nullptr;
+	std::string result = sender ? sender : "";
+	if (settings)
+		obs_data_release(settings);
+	return result;
+}
+
+size_t matching_receiver_count(const std::string &source_name)
+{
+	obs_source_t *selected = obs_get_source_by_name(source_name.c_str());
+	if (!selected)
+		return 0;
+	const std::string sender_name = ndi_sender_for_source(selected);
+	obs_source_release(selected);
+	if (sender_name.empty())
+		return 0;
+
+	struct MatchContext {
+		const std::string *sender = nullptr;
+		size_t count = 0;
+	} context{&sender_name, 0};
+	obs_enum_sources(
+		[](void *param, obs_source_t *source) {
+			auto *match = static_cast<MatchContext *>(param);
+			const char *id = obs_source_get_id(source);
+			if (id && std::strcmp(id, "ndi_source") == 0 &&
+				ndi_sender_for_source(source) == *match->sender)
+				++match->count;
+			return true;
+		},
+		&context);
+	return context.count;
+}
+
+QStringList scenes_containing_source(const std::string &source_name)
+{
+	QStringList names;
+	obs_frontend_source_list scenes{};
+	obs_frontend_get_scenes(&scenes);
+	for (size_t i = 0; i < scenes.sources.num; ++i) {
+		obs_source_t *scene_source = scenes.sources.array[i];
+		obs_scene_t *scene = obs_scene_from_source(scene_source);
+		if (scene && obs_scene_find_source(scene, source_name.c_str())) {
+			const char *name = obs_source_get_name(scene_source);
+			if (name && *name)
+				names.append(QString::fromUtf8(name));
+		}
+	}
+	obs_frontend_source_list_free(&scenes);
+	return names;
+}
+
+bool add_existing_source_to_current_scene(const std::string &source_name)
+{
+	obs_source_t *scene_source = obs_frontend_get_current_scene();
+	obs_source_t *source = obs_get_source_by_name(source_name.c_str());
+	if (!scene_source || !source) {
+		if (source)
+			obs_source_release(source);
+		if (scene_source)
+			obs_source_release(scene_source);
+		return false;
+	}
+	obs_scene_t *scene = obs_scene_from_source(scene_source);
+	const bool success = scene &&
+		(source_in_current_scene(scene, source_name.c_str()) || obs_scene_add(scene, source));
+	obs_source_release(source);
+	obs_source_release(scene_source);
+	return success;
+}
+
 int meter_value(float peak)
 {
 	if (peak <= 0.00001f)
@@ -724,16 +807,80 @@ public:
 	{
 		ensure_defaults();
 		auto *outer = new QVBoxLayout(this);
+		outer->setContentsMargins(0, 0, 0, 0);
 		auto *scroll = new QScrollArea(this);
 		scroll->setWidgetResizable(true);
 		auto *body = new QWidget(scroll);
-		auto *layout = new QVBoxLayout(body);
+		auto *root_layout = new QVBoxLayout(body);
+		root_layout->setContentsMargins(6, 6, 6, 6);
+		root_layout->setSpacing(5);
 
-		auto *title = new QLabel(QString("<b>Multichannel Bridge for DistroAV %1</b>").arg(kVersion), body);
-		layout->addWidget(title);
+		auto *title_row = new QHBoxLayout;
+		setup_toggle_ = new QToolButton(body);
+		setup_toggle_->setCheckable(true);
+		setup_toggle_->setText("▸ Setup");
+		setup_toggle_->setToolTip("Show role, source, recovery, and advanced settings.");
+		numbers_toggle_ = new QToolButton(body);
+		numbers_toggle_->setCheckable(true);
+		numbers_toggle_->setText("▸ Numbers");
+		numbers_toggle_->setToolTip("Show the useful timing numbers without opening all setup controls.");
+		title_row->addWidget(setup_toggle_);
+		title_row->addWidget(numbers_toggle_);
+		auto *title = new QLabel(QString("<b>Multichannel Bridge %1</b>").arg(kVersion), body);
+		title_row->addWidget(title, 1);
+		root_layout->addLayout(title_row);
+
+		monitor_panel_ = new QWidget(body);
+		auto *monitor_layout = new QVBoxLayout(monitor_panel_);
+		monitor_layout->setContentsMargins(0, 0, 0, 0);
+		monitor_layout->setSpacing(4);
+		health_banner_ = new QLabel(monitor_panel_);
+		health_banner_->setWordWrap(true);
+		health_banner_->setTextFormat(Qt::RichText);
+		health_banner_->setMinimumHeight(34);
+		timing_summary_ = new QLabel(monitor_panel_);
+		timing_summary_->setWordWrap(true);
+		timing_summary_->setTextFormat(Qt::RichText);
+		suggestion_ = new QLabel(monitor_panel_);
+		suggestion_->setWordWrap(true);
+		suggestion_->setTextFormat(Qt::RichText);
+		monitor_layout->addWidget(health_banner_);
+		monitor_layout->addWidget(timing_summary_);
+
+		auto *monitor_meter_row = new QHBoxLayout;
+		monitor_program_label_ = new QLabel("Desktop + game", monitor_panel_);
+		monitor_mic_label_ = new QLabel("Microphone", monitor_panel_);
+		monitor_program_meter_ = new QProgressBar(monitor_panel_);
+		monitor_mic_meter_ = new QProgressBar(monitor_panel_);
+		for (auto *meter : {monitor_program_meter_, monitor_mic_meter_}) {
+			meter->setRange(0, 100);
+			meter->setTextVisible(false);
+			meter->setMaximumHeight(9);
+		}
+		monitor_meter_row->addWidget(monitor_program_label_);
+		monitor_meter_row->addWidget(monitor_program_meter_, 1);
+		monitor_meter_row->addWidget(monitor_mic_label_);
+		monitor_meter_row->addWidget(monitor_mic_meter_, 1);
+		monitor_layout->addLayout(monitor_meter_row);
+		monitor_layout->addWidget(suggestion_);
+
+		monitor_numbers_panel_ = new QWidget(monitor_panel_);
+		auto *numbers_layout = new QVBoxLayout(monitor_numbers_panel_);
+		numbers_layout->setContentsMargins(6, 2, 6, 2);
+		monitor_numbers_ = new QLabel(monitor_numbers_panel_);
+		monitor_numbers_->setWordWrap(true);
+		monitor_numbers_->setTextFormat(Qt::RichText);
+		numbers_layout->addWidget(monitor_numbers_);
+		monitor_numbers_panel_->setVisible(false);
+		monitor_layout->addWidget(monitor_numbers_panel_);
+		root_layout->addWidget(monitor_panel_);
+
+		configuration_panel_ = new QWidget(body);
+		auto *layout = new QVBoxLayout(configuration_panel_);
+		layout->setContentsMargins(0, 0, 0, 0);
+		layout->setSpacing(5);
 		auto *intro = new QLabel(
-			"Install the same custom DistroAV package on both PCs. Select exactly one role on each PC, "
-			"confirm it, then apply.", body);
+			"Install the same package on both PCs, select one role, then apply.", configuration_panel_);
 		intro->setWordWrap(true);
 		layout->addWidget(intro);
 
@@ -796,9 +943,16 @@ public:
 		source_row_layout->addWidget(reconnect_receiver_);
 		source_row_layout->addWidget(open_source_);
 		receiver_form->addRow("DistroAV NDI video source:", source_row);
+		source_context_ = new QLabel(receiver_box_);
+		source_context_->setWordWrap(true);
+		add_receiver_here_ = new QPushButton("Add this existing receiver to current scene", receiver_box_);
+		add_receiver_here_->setToolTip(
+			"Adds a reference to the attached receiver. It does not create another NDI connection.");
+		receiver_form->addRow("Shared source:", source_context_);
+		receiver_form->addRow(add_receiver_here_);
 
 		governor_box_ = new QGroupBox(
-			QString("A/V Governor %1 - shared timeline protection").arg(kGovernorVersion), receiver_box_);
+			QString("Automatic A/V protection (Governor %1)").arg(kGovernorVersion), receiver_box_);
 		governor_box_->setCheckable(true);
 		auto *governor_form = new QFormLayout(governor_box_);
 		auto_configure_ = new QCheckBox(
@@ -836,17 +990,17 @@ public:
 		relock_pairs_->setToolTip(
 			"Minimum number of sane audio/video observations required during the baseline-learning window.");
 		baseline_window_ms_ = new QSpinBox(governor_box_);
-		baseline_window_ms_->setRange(250, 5000);
+		baseline_window_ms_->setRange(5000, 30000);
 		baseline_window_ms_->setSuffix(" ms");
 		baseline_window_ms_->setToolTip(
-			"How long the governor learns a robust median baseline before releasing either path.");
+			"Required stable time before the first trusted reference or a recovery verification is accepted.");
 		drift_window_ms_ = new QSpinBox(governor_box_);
-		drift_window_ms_->setRange(5000, 120000);
+		drift_window_ms_->setRange(30000, 300000);
 		drift_window_ms_->setSuffix(" ms");
 		drift_window_ms_->setToolTip(
 			"History used to distinguish real clock drift from short-term network jitter.");
 		drift_minimum_ms_ = new QSpinBox(governor_box_);
-		drift_minimum_ms_->setRange(2000, 120000);
+		drift_minimum_ms_->setRange(30000, 300000);
 		drift_minimum_ms_->setSuffix(" ms");
 		drift_minimum_ms_->setToolTip(
 			"A drift direction must persist for at least this long before video timing is adjusted.");
@@ -856,14 +1010,14 @@ public:
 		drift_deadband_ppm_->setToolTip(
 			"Ignore smaller estimated clock differences so normal jitter cannot trigger correction.");
 		governor_help_ = new QLabel(
-			"Recommended mode learns a one-second median baseline, ignores short jitter, adjusts only video after confirmed drift, "
-			"and fails open with normal DistroAV output whenever its timing model is not ready.", governor_box_);
+			"Keeps the last trusted sync through jumps, quarantines recovery samples, waits at least 30 seconds before drift correction, "
+			"and bypasses correction if safe recovery cannot be verified.", governor_box_);
 		governor_help_->setWordWrap(true);
 		governor_status_ = new QLabel(governor_box_);
 		governor_status_->setWordWrap(true);
 		recommended_governor_ = new QPushButton("Restore recommended settings", governor_box_);
 		recommended_governor_->setToolTip("Restore conservative settings suitable for a single two-PC NDI source.");
-		advanced_governor_ = new QCheckBox("Show advanced timing controls", governor_box_);
+		advanced_governor_ = new QCheckBox("Show expert timing controls", governor_box_);
 		advanced_governor_panel_ = new QWidget(governor_box_);
 		auto *advanced_form = new QFormLayout(advanced_governor_panel_);
 		advanced_form->setContentsMargins(0, 0, 0, 0);
@@ -884,7 +1038,7 @@ public:
 		governor_form->addRow(advanced_governor_panel_);
 		governor_form->addRow(governor_help_);
 		governor_form->addRow(recommended_governor_);
-		governor_form->addRow("Governor status:", governor_status_);
+		governor_form->addRow("Protection:", governor_status_);
 		receiver_form->addRow(governor_box_);
 
 		program_name_ = new QLineEdit(receiver_box_);
@@ -929,20 +1083,44 @@ public:
 		checklist_->setWordWrap(true);
 		layout->addWidget(checklist_);
 		layout->addStretch(1);
+		root_layout->addWidget(configuration_panel_);
+		root_layout->addStretch(1);
 		scroll->setWidget(body);
 		outer->addWidget(scroll);
 
 		load_ui();
 		refresh_sources();
 		update_role_visibility();
+		setup_toggle_->setChecked(mcb_role() == MCBRole::Unconfigured);
+		configuration_panel_->setVisible(setup_toggle_->isChecked());
+		setup_toggle_->setText(setup_toggle_->isChecked() ? "▾ Setup" : "▸ Setup");
 		update_status();
 
+		connect(setup_toggle_, &QToolButton::toggled, this, [this](bool expanded) {
+			configuration_panel_->setVisible(expanded);
+			setup_toggle_->setText(expanded ? "▾ Setup" : "▸ Setup");
+		});
+		connect(numbers_toggle_, &QToolButton::toggled, this, [this](bool expanded) {
+			monitor_numbers_panel_->setVisible(expanded);
+			numbers_toggle_->setText(expanded ? "▾ Numbers" : "▸ Numbers");
+		});
 		connect(sender_radio_, &QRadioButton::toggled, this, [this] { role_changed(); });
 		connect(receiver_radio_, &QRadioButton::toggled, this, [this] { role_changed(); });
 		connect(confirm_, &QCheckBox::toggled, this, [this] { apply_->setEnabled(confirm_->isChecked()); });
 		connect(refresh_, &QPushButton::clicked, this, [this] { refresh_sources(); });
+		connect(receiver_source_, &QComboBox::currentTextChanged, this, [this] { refresh_source_context(); });
+		connect(add_receiver_here_, &QPushButton::clicked, this, [this] {
+			const std::string name = receiver_source_->currentText().toUtf8().constData();
+			const bool ok = add_existing_source_to_current_scene(name);
+			checklist_->setText(ok
+				? "Added a reference to the existing NDI receiver in this scene. No duplicate connection was created."
+				: "Could not add the existing receiver. Select a valid DistroAV source first.");
+			refresh_source_context();
+		});
 		connect(reconnect_receiver_, &QPushButton::clicked, this, [this] {
 			const bool ok = ReceiverRouter::instance().force_reconnect();
+			if (ok)
+				auto_reconnect_attempts_ = 0;
 			checklist_->setText(ok
 				? "Existing DistroAV source reconnected in place; scene layout and filters were preserved."
 				: "Reconnect was unavailable. Confirm this is a DistroAV NDI Source created by the bridge build.");
@@ -960,9 +1138,9 @@ public:
 			max_video_correction_ms_->setValue(40);
 			correction_slew_ppm_->setValue(1000);
 			relock_pairs_->setValue(12);
-			baseline_window_ms_->setValue(1000);
-			drift_window_ms_->setValue(30000);
-			drift_minimum_ms_->setValue(10000);
+			baseline_window_ms_->setValue(5000);
+			drift_window_ms_->setValue(120000);
+			drift_minimum_ms_->setValue(30000);
 			drift_deadband_ppm_->setValue(8);
 			checklist_->setText("Recommended A/V Governor settings restored. Click Apply role and settings.");
 		});
@@ -996,6 +1174,10 @@ public:
 		timer_ = new QTimer(this);
 		timer_->setInterval(1000);
 		connect(timer_, &QTimer::timeout, this, [this] { update_status(); });
+		safety_timer_ = new QTimer(this);
+		safety_timer_->setInterval(2000);
+		connect(safety_timer_, &QTimer::timeout, this, [this] { automatic_recovery_tick(); });
+		safety_timer_->start();
 	}
 
 	void frontend_finished_loading()
@@ -1017,11 +1199,166 @@ public:
 		const int index = receiver_source_->findText(desired);
 		if (index >= 0)
 			receiver_source_->setCurrentIndex(index);
+		refresh_source_context();
+	}
+
+	void refresh_source_context()
+	{
+		const std::string source_name = receiver_source_->currentText().toUtf8().constData();
+		if (source_name.empty()) {
+			source_context_->setText("No receiver selected.");
+			return;
+		}
+		const size_t matches = matching_receiver_count(source_name);
+		const QStringList scenes = scenes_containing_source(source_name);
+		QString text = scenes.isEmpty()
+			? "Not present in a scene. Add this existing receiver instead of creating a duplicate."
+			: QString("Used by: %1.").arg(scenes.join(", "));
+		if (matches > 1)
+			text += QString(" <b><span style='color:#e6b450'>%1 separate receivers use the same NDI sender.</span></b>")
+				.arg(matches);
+		else
+			text += " One canonical receiver detected.";
+		source_context_->setText(text);
 	}
 
 	void quick_restart_sender() { restart_sender(); }
 
 private:
+	void set_health_banner(const QString &text, const char *foreground, const char *background)
+	{
+		health_banner_->setText(text);
+		health_banner_->setStyleSheet(QString(
+			"QLabel { color: %1; background: %2; border: 1px solid %1; border-radius: 4px; padding: 6px; }")
+			.arg(QString::fromUtf8(foreground), QString::fromUtf8(background)));
+	}
+
+	void update_sender_monitor(const MCBSenderStatus &status, double age_ms, uint32_t rate)
+	{
+		monitor_program_label_->setText(QString("Track %1").arg(status.track_a));
+		monitor_mic_label_->setText(QString("Track %1").arg(status.track_b));
+		monitor_program_meter_->setValue(meter_value(status.peak_a));
+		monitor_mic_meter_->setValue(meter_value(status.peak_b));
+		const bool healthy = status.active && rate == 48000 && status.discarded_blocks == 0 &&
+			status.silence_fallback_blocks == 0 && status.oversized_blocks == 0 &&
+			status.contention_drops == 0;
+		if (healthy) {
+			set_health_banner("<b>Sender protected</b> — both audio tracks are paired and moving normally.",
+				"#57c785", "rgba(40,95,68,90)");
+			timing_summary_->setText(QString(
+				"<b>Track %1</b> → NDI 1–2 &nbsp;·&nbsp; <b>Track %2</b> → NDI 3–4")
+				.arg(status.track_a).arg(status.track_b));
+			suggestion_->setText("<b>Suggested:</b> No action needed.");
+		} else if (!status.active) {
+			set_health_banner("<b>Sender offline</b> — DistroAV Main Output is not running.",
+				"#e05d5d", "rgba(110,45,45,90)");
+			timing_summary_->setText("Audio is not currently being packed into the NDI sender.");
+			suggestion_->setText("<b>Suggested:</b> Start Main Output or use <b>Restart Bridge</b> in Setup.");
+		} else {
+			set_health_banner("<b>Sender needs attention</b> — one or more safety counters increased.",
+				"#e6b450", "rgba(105,76,30,90)");
+			timing_summary_->setText(QString(
+				"Discards <b>%1</b> · fallback <b>%2</b> · contention <b>%3</b>")
+				.arg(static_cast<qulonglong>(status.discarded_blocks))
+				.arg(static_cast<qulonglong>(status.silence_fallback_blocks))
+				.arg(static_cast<qulonglong>(status.contention_drops)));
+			suggestion_->setText("<b>Suggested:</b> Open Setup and use <b>Re-anchor sync</b>; restart only if counters keep rising.");
+		}
+		monitor_numbers_->setText(QString(
+			"<b>Paired:</b> %1 &nbsp;·&nbsp; <b>Audio age:</b> %2 ms &nbsp;·&nbsp; "
+			"<b>Callback spacing:</b> %3 ms<br>Discards %4 · fallback %5 · re-anchors %6 · epoch %7")
+			.arg(static_cast<qulonglong>(status.paired_blocks)).arg(age_ms, 0, 'f', 1)
+			.arg(static_cast<double>(status.last_timestamp_delta_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<qulonglong>(status.discarded_blocks))
+			.arg(static_cast<qulonglong>(status.silence_fallback_blocks))
+			.arg(static_cast<qulonglong>(status.reanchors)).arg(static_cast<qulonglong>(status.epoch)));
+	}
+
+	void update_receiver_monitor(const ReceiverRouter &router, const mcb::AVGovernorSnapshot &governor,
+		double receiver_age_ms)
+	{
+		monitor_program_label_->setText("Desktop + game");
+		monitor_mic_label_->setText("Microphone");
+		monitor_program_meter_->setValue(meter_value(router.peak(0)));
+		monitor_mic_meter_->setValue(meter_value(router.peak(1)));
+		const std::string source_name = router.input_name();
+		const size_t duplicate_count = matching_receiver_count(source_name);
+		const bool connection_ready = router.attached() && router.outputs_active() && router.channels() >= 4 &&
+			receiver_age_ms >= 0.0 && receiver_age_ms < 500.0;
+		const double skew_ms = static_cast<double>(governor.av_skew_ns) / 1e6;
+		const double deviation_ms = static_cast<double>(governor.baseline_deviation_ns) / 1e6;
+		const double correction_ms = static_cast<double>(governor.video_correction_ns) / 1e6;
+		const double absolute_deviation = std::fabs(deviation_ms);
+		QString direction;
+		if (!governor.baseline_valid) {
+			direction = "Learning the normal relationship between the shared audio timeline and video.";
+		} else if (absolute_deviation < 2.0) {
+			direction = "<span style='color:#57c785'><b>Timelines aligned</b></span> — no track is meaningfully rushing or dragging.";
+		} else if (deviation_ms > 0.0) {
+			direction = QString(
+				"<span style='color:#e6b450'><b>Desktop + mic rushing</b></span> by %1 ms · video timeline dragging.")
+				.arg(absolute_deviation, 0, 'f', 1);
+		} else {
+			direction = QString(
+				"<span style='color:#e6b450'><b>Video rushing</b></span> by %1 ms · desktop + mic timeline dragging.")
+				.arg(absolute_deviation, 0, 'f', 1);
+		}
+		timing_summary_->setText(direction);
+
+		if (duplicate_count > 1) {
+			set_health_banner(QString("<b>Setup conflict</b> — %1 separate NDI receivers use the same sender.").arg(duplicate_count),
+				"#e6b450", "rgba(105,76,30,90)");
+			suggestion_->setText("<b>Suggested:</b> Keep one receiver and add it to other scenes as an existing source.");
+		} else if (!connection_ready) {
+			set_health_banner("<b>Receiver waiting</b> — the complete four-channel feed is not active.",
+				"#e05d5d", "rgba(110,45,45,90)");
+			suggestion_->setText("<b>Suggested:</b> Open Setup, select the canonical receiver, then reconnect or repair outputs.");
+		} else if (!governor.enabled) {
+			set_health_banner("<b>Monitoring only</b> — split audio is healthy; automatic timing protection is off.",
+				"#b8bec9", "rgba(70,74,82,90)");
+			suggestion_->setText("<b>Suggested:</b> Leave off for raw DistroAV timing, or enable protection in Setup.");
+		} else if (governor.phase == mcb::AVGovernorPhase::Failed || governor.fail_safe_bypassed) {
+			set_health_banner("<b>Needs attention</b> — trusted sync could not be restored; correction is bypassed.",
+				"#e05d5d", "rgba(110,45,45,90)");
+			suggestion_->setText("<b>Suggested:</b> Reconnect the existing receiver. Output is being kept live unchanged.");
+		} else if (governor.phase == mcb::AVGovernorPhase::Holding ||
+			governor.phase == mcb::AVGovernorPhase::Verifying ||
+			governor.phase == mcb::AVGovernorPhase::WarmingUp) {
+			set_health_banner(QString("<b>Recovering safely</b> — %1.").arg(governor_reason_name(governor.reason)),
+				"#5aa9e6", "rgba(42,76,110,90)");
+			suggestion_->setText("<b>Suggested:</b> Leave it running. Normal output stays live while the trusted sync is verified.");
+		} else if (governor.correction_limited) {
+			set_health_banner("<b>Drift exceeds the safe correction range</b> — protection will not chase it further.",
+				"#e6b450", "rgba(105,76,30,90)");
+			suggestion_->setText("<b>Suggested:</b> Check the audio device clock or reconnect the canonical receiver.");
+		} else if (std::fabs(correction_ms) >= 0.1) {
+			set_health_banner("<b>Correcting slow drift</b> — video timing is moving gently toward the trusted sync.",
+				"#5aa9e6", "rgba(42,76,110,90)");
+			suggestion_->setText("<b>Suggested:</b> No action needed.");
+		} else {
+			set_health_banner("<b>Protected</b> — four channels are healthy and trusted sync is locked.",
+				"#57c785", "rgba(40,95,68,90)");
+			suggestion_->setText("<b>Suggested:</b> No action needed.");
+		}
+
+		const double drift_seconds = static_cast<double>(governor.drift_samples) * 0.25;
+		const QString drift_text = governor.drift_confidence >= 75
+			? QString("%1 ppm · verified").arg(static_cast<qlonglong>(governor.drift_ppm))
+			: QString("measuring · about %1 s collected").arg(drift_seconds, 0, 'f', 0);
+		monitor_numbers_->setText(QString(
+			"<b>Current A/V relation:</b> %1 ms &nbsp;·&nbsp; <b>Change from trusted sync:</b> %2 ms<br>"
+			"<b>Trusted reference:</b> %3 ms &nbsp;·&nbsp; <b>Drift:</b> %4<br>"
+			"<b>Video correction:</b> %5 ms &nbsp;·&nbsp; <b>Packet age:</b> %6 ms<br>"
+			"Recoveries %7 · failed recoveries %8 · missing desktop/mic %9/%10")
+			.arg(skew_ms, 0, 'f', 2).arg(deviation_ms, 0, 'f', 2)
+			.arg(static_cast<double>(governor.baseline_skew_ns) / 1e6, 0, 'f', 2)
+			.arg(drift_text).arg(correction_ms, 0, 'f', 2).arg(receiver_age_ms, 0, 'f', 1)
+			.arg(static_cast<qulonglong>(governor.atomic_recoveries))
+			.arg(static_cast<qulonglong>(governor.failed_recoveries))
+			.arg(static_cast<qulonglong>(router.missing_program()))
+			.arg(static_cast<qulonglong>(router.missing_mic())));
+	}
+
 	void reanchor_sender()
 	{
 		if (!mcb_is_sender()) {
@@ -1059,6 +1396,18 @@ private:
 	void showEvent(QShowEvent *event) override
 	{
 		QWidget::showEvent(event);
+		// A floating OBS dock is a top-level Qt window. Explicitly inherit OBS's
+		// application icon so Windows does not show a generic white-page taskbar icon.
+		QIcon obs_icon = QApplication::windowIcon();
+		for (QWidget *ancestor = parentWidget(); ancestor; ancestor = ancestor->parentWidget()) {
+			if (!ancestor->windowIcon().isNull())
+				obs_icon = ancestor->windowIcon();
+		}
+		if (!obs_icon.isNull()) {
+			setWindowIcon(obs_icon);
+			if (QWidget *top = window())
+				top->setWindowIcon(obs_icon);
+		}
 		g_ui_monitoring.store(true, std::memory_order_release);
 		update_status();
 		if (timer_)
@@ -1101,11 +1450,11 @@ private:
 		relock_pairs_->setValue(
 			config ? static_cast<int>(config_get_int(config, kSection, "GovernorRelockPairs")) : 12);
 		baseline_window_ms_->setValue(
-			config ? static_cast<int>(config_get_int(config, kSection, "GovernorBaselineWindowMs")) : 1000);
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorBaselineWindowMs")) : 5000);
 		drift_window_ms_->setValue(
-			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftWindowMs")) : 30000);
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftWindowMs")) : 120000);
 		drift_minimum_ms_->setValue(
-			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftMinimumMs")) : 10000);
+			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftMinimumMs")) : 30000);
 		drift_deadband_ppm_->setValue(
 			config ? static_cast<int>(config_get_int(config, kSection, "GovernorDriftDeadbandPpm")) : 8);
 		apply_->setEnabled(confirm_->isChecked());
@@ -1193,6 +1542,7 @@ private:
 						   .arg(QString::fromUtf8(ReceiverRouter::instance().last_error().c_str())));
 			return;
 		}
+		auto_reconnect_attempts_ = 0;
 		ReceiverRouter::instance().set_suppress_original(suppress_original_->isChecked());
 		ReceiverRouter::instance().configure_governor(
 			governor_box_->isChecked(), max_skew_ms_->value(), video_stall_ms_->value(),
@@ -1265,72 +1615,94 @@ private:
 			? static_cast<double>(now - router.last_packet_ns()) / 1e6
 			: -1.0;
 		const auto governor = router.governor_snapshot();
-		QString text;
-		text += QString("Multichannel Bridge for DistroAV %1\nRole: %2\nOBS audio rate: %3 Hz\n")
+		QString text = QString("Multichannel Bridge for DistroAV %1\nRole: %2\nOBS audio rate: %3 Hz\n")
 			.arg(kVersion)
 			.arg(mcb_is_sender() ? "Gaming PC / Sender" : mcb_is_receiver() ? "Stream PC / Receiver" : "Unconfigured")
 			.arg(obs_get_audio() ? audio_output_get_sample_rate(obs_get_audio()) : 0);
-		text += QString("Sender Sync Core %1\nSender active: %2\nTracks: %3 / %4\nPaired: %5\nDiscarded: %6\nSilence fallback: %7\n")
-			.arg(kSenderCoreVersion)
-			.arg(sender.active ? "yes" : "no").arg(sender.track_a).arg(sender.track_b)
-			.arg(static_cast<qulonglong>(sender.paired_blocks))
-			.arg(static_cast<qulonglong>(sender.discarded_blocks))
-			.arg(static_cast<qulonglong>(sender.silence_fallback_blocks));
-		text += QString("Discontinuities: %1\nRe-anchors: %2\nOversized blocks: %3\nCallback contention drops: %4\nSender epoch: %5\n")
-			.arg(static_cast<qulonglong>(sender.discontinuities))
-			.arg(static_cast<qulonglong>(sender.reanchors))
-			.arg(static_cast<qulonglong>(sender.oversized_blocks))
-			.arg(static_cast<qulonglong>(sender.contention_drops))
-			.arg(static_cast<qulonglong>(sender.epoch));
-		text += QString("Last timestamp delta: %1 ms\nQueues: %2 / %3\nSender audio age: %4 ms\n")
-			.arg(static_cast<double>(sender.last_timestamp_delta_ns) / 1e6, 0, 'f', 3)
-			.arg(sender.queue_depth_a).arg(sender.queue_depth_b).arg(sender_age, 0, 'f', 1);
-		text += QString("Receiver attached: %1\nSplit outputs ready: %2\nSplit outputs active: %3\nDetected channels: %4\n")
-			.arg(router.attached() ? "yes" : "no").arg(router.outputs_ready() ? "yes" : "no")
-			.arg(router.outputs_active() ? "yes" : "no").arg(router.channels());
-		text += QString("Packets: %1\nSuppressed original packets: %2\nReceiver packet age: %3 ms\nMissing program: %4\nMissing mic: %5\n")
+		if (mcb_is_sender()) {
+			text += QString(
+				"Sender Sync Core %1\nActive: %2\nTracks: %3 / %4\nPaired blocks: %5\n"
+				"Discards / silence fallback: %6 / %7\nDiscontinuities / re-anchors: %8 / %9\n"
+				"Oversized / callback contention: %10 / %11\nCallback spacing: %12 ms\n"
+				"Queues: %13 / %14\nAudio age: %15 ms\nEpoch: %16")
+				.arg(kSenderCoreVersion).arg(sender.active ? "yes" : "no")
+				.arg(sender.track_a).arg(sender.track_b)
+				.arg(static_cast<qulonglong>(sender.paired_blocks))
+				.arg(static_cast<qulonglong>(sender.discarded_blocks))
+				.arg(static_cast<qulonglong>(sender.silence_fallback_blocks))
+				.arg(static_cast<qulonglong>(sender.discontinuities))
+				.arg(static_cast<qulonglong>(sender.reanchors))
+				.arg(static_cast<qulonglong>(sender.oversized_blocks))
+				.arg(static_cast<qulonglong>(sender.contention_drops))
+				.arg(static_cast<double>(sender.last_timestamp_delta_ns) / 1e6, 0, 'f', 3)
+				.arg(sender.queue_depth_a).arg(sender.queue_depth_b).arg(sender_age, 0, 'f', 1)
+				.arg(static_cast<qulonglong>(sender.epoch));
+			return text;
+		}
+		if (!mcb_is_receiver())
+			return text + "Status: setup required";
+
+		const double deviation = static_cast<double>(governor.baseline_deviation_ns) / 1e6;
+		const QString direction = std::fabs(deviation) < 2.0
+			? "aligned"
+			: deviation > 0.0 ? "desktop + mic ahead; video dragging" : "video ahead; desktop + mic dragging";
+		text += QString(
+			"Receiver: %1\nCanonical source: %2\nReceivers using same NDI sender: %3\n"
+			"Split outputs: %4\nChannels: %5\nPackets / suppressed original: %6 / %7\n"
+			"Packet age: %8 ms\nMissing desktop / mic: %9 / %10\n"
+			"A/V Governor %11: %12\nState: %13\nReason: %14\nFail-safe bypass: %15\n"
+			"Timing direction: %16 by %17 ms\nCurrent raw / filtered relation: %18 / %19 ms\n"
+			"Trusted reference / recovery candidate: %20 / %21 ms\n"
+			"Drift: %22 ppm (%23 percent maturity, %24 samples)\nVideo correction / target: %25 / %26 ms\n"
+			"Correction limited: %27\nPlayout target / audio / video depth: %28 / %29 / %30 ms\n"
+			"Clock-domain offset: %31 ms\nDiscontinuities / recoveries / failed: %32 / %33 / %34\n"
+			"Quarantined samples: %35\nProtected recorder events: %36\nEpoch: %37")
+			.arg(router.attached() ? "attached" : "not attached")
+			.arg(QString::fromUtf8(router.input_name().c_str()))
+			.arg(static_cast<qulonglong>(matching_receiver_count(router.input_name())))
+			.arg(router.outputs_active() ? "active" : "inactive").arg(router.channels())
 			.arg(static_cast<qulonglong>(router.packets())).arg(static_cast<qulonglong>(router.suppressed()))
 			.arg(receiver_age, 0, 'f', 1).arg(static_cast<qulonglong>(router.missing_program()))
-			.arg(static_cast<qulonglong>(router.missing_mic()));
-		text += QString("A/V Governor %1: %2\nPhase: %3\nReason: %4\nSource timing configured: %5\n")
-			.arg(kGovernorVersion).arg(governor.enabled ? "enabled" : "disabled")
-			.arg(governor_phase_name(governor.phase)).arg(governor_reason_name(governor.reason))
-			.arg(governor.source_configured ? "yes" : "no");
-		text += QString("Playout delay: %1 ms\nPlayout depth audio/video: %2 / %3 ms\nEstimated video interval: %4 ms\n")
-			.arg(static_cast<double>(governor.playout_delay_ns) / 1e6, 0, 'f', 1)
-			.arg(static_cast<double>(governor.audio_playout_depth_ns) / 1e6, 0, 'f', 3)
-			.arg(static_cast<double>(governor.video_playout_depth_ns) / 1e6, 0, 'f', 3)
-			.arg(static_cast<double>(governor.estimated_video_interval_ns) / 1e6, 0, 'f', 3);
-		text += QString("Raw/filtered A/V skew: %1 / %2 ms\nLearned baseline: %3 ms (%4 samples over %5 ms)\nBaseline deviation: %6 ms\n")
+			.arg(static_cast<qulonglong>(router.missing_mic())).arg(kGovernorVersion)
+			.arg(governor.enabled ? "enabled" : "disabled").arg(governor_phase_name(governor.phase))
+			.arg(governor_reason_name(governor.reason)).arg(governor.fail_safe_bypassed ? "yes" : "no")
+			.arg(direction).arg(std::fabs(deviation), 0, 'f', 2)
 			.arg(static_cast<double>(governor.raw_av_skew_ns) / 1e6, 0, 'f', 3)
 			.arg(static_cast<double>(governor.av_skew_ns) / 1e6, 0, 'f', 3)
 			.arg(static_cast<double>(governor.baseline_skew_ns) / 1e6, 0, 'f', 3)
-			.arg(governor.baseline_samples)
-			.arg(static_cast<double>(governor.baseline_window_ns) / 1e6, 0, 'f', 0)
-			.arg(static_cast<double>(governor.baseline_deviation_ns) / 1e6, 0, 'f', 3);
-		text += QString("Estimated drift: %1 ppm (%2% confidence, %3 samples)\nVideo correction: %4 ms (target %5 ms)\nEpoch rebase: %6 ms\n")
-			.arg(static_cast<qlonglong>(governor.drift_ppm)).arg(governor.drift_confidence).arg(governor.drift_samples)
+			.arg(static_cast<double>(governor.candidate_baseline_skew_ns) / 1e6, 0, 'f', 3)
+			.arg(static_cast<qlonglong>(governor.drift_ppm)).arg(governor.drift_confidence)
+			.arg(governor.drift_samples)
 			.arg(static_cast<double>(governor.video_correction_ns) / 1e6, 0, 'f', 3)
 			.arg(static_cast<double>(governor.target_video_correction_ns) / 1e6, 0, 'f', 3)
-			.arg(static_cast<double>(governor.epoch_rebase_ns) / 1e6, 0, 'f', 3);
-		text += QString("Blocked audio/video: %1 / %2\nFade-out/fade-in packets: %3 / %4\nMonotonic clamps: %5\n")
-			.arg(static_cast<qulonglong>(governor.blocked_audio)).arg(static_cast<qulonglong>(governor.blocked_video))
-			.arg(static_cast<qulonglong>(governor.fade_out_packets)).arg(static_cast<qulonglong>(governor.fade_in_packets))
-			.arg(static_cast<qulonglong>(governor.monotonic_clamps));
-		text += QString("Raw NDI audio timestamp/timecode: %1 / %2 (100 ns)\nRaw NDI video timestamp/timecode: %3 / %4 (100 ns)\n")
-			.arg(static_cast<qlonglong>(governor.last_audio_ndi_timestamp_100ns))
-			.arg(static_cast<qlonglong>(governor.last_audio_ndi_timecode_100ns))
-			.arg(static_cast<qlonglong>(governor.last_video_ndi_timestamp_100ns))
-			.arg(static_cast<qlonglong>(governor.last_video_ndi_timecode_100ns));
-		text += QString("Discontinuities: %1\nLock acquisitions: %2\nAtomic recoveries: %3\nEpoch: %4\n")
+			.arg(governor.correction_limited ? "yes" : "no")
+			.arg(static_cast<double>(governor.playout_delay_ns) / 1e6, 0, 'f', 1)
+			.arg(static_cast<double>(governor.audio_playout_depth_ns) / 1e6, 0, 'f', 1)
+			.arg(static_cast<double>(governor.video_playout_depth_ns) / 1e6, 0, 'f', 1)
+			.arg(static_cast<double>(governor.epoch_rebase_ns) / 1e6, 0, 'f', 3)
 			.arg(static_cast<qulonglong>(governor.discontinuities))
-			.arg(static_cast<qulonglong>(governor.lock_acquisitions))
 			.arg(static_cast<qulonglong>(governor.atomic_recoveries))
-			.arg(static_cast<qulonglong>(governor.epoch));
-		text += QString("Re-lock progress: %1 / %2\nCorrection updates: %3\nFlight recorder events: %4")
-			.arg(governor.relock_progress).arg(governor.relock_required)
-			.arg(static_cast<qulonglong>(governor.correction_updates)).arg(governor.recorder_events);
+			.arg(static_cast<qulonglong>(governor.failed_recoveries))
+			.arg(static_cast<qulonglong>(governor.quarantined_samples))
+			.arg(governor.recorder_events).arg(static_cast<qulonglong>(governor.epoch));
 		return text;
+	}
+
+	void automatic_recovery_tick()
+	{
+		if (!mcb_is_receiver() || auto_reconnect_attempts_ != 0)
+			return;
+		auto &router = ReceiverRouter::instance();
+		const auto governor = router.governor_snapshot();
+		if (!governor.fail_safe_bypassed)
+			return;
+		++auto_reconnect_attempts_;
+		const bool reconnected = router.force_reconnect();
+		checklist_->setText(reconnected
+			? "Automatic recovery reconnected the existing receiver once. The trusted sync is being verified."
+			: "Automatic recovery could not reconnect this source. Output remains live unchanged; reconnect manually in Setup.");
+		if (isVisible())
+			update_status();
 	}
 
 	void update_status()
@@ -1373,8 +1745,18 @@ private:
 				.arg(rate_warning));
 		sender_program_meter_->setValue(meter_value(status.peak_a));
 		sender_mic_meter_->setValue(meter_value(status.peak_b));
-		if (!mcb_is_receiver())
+		if (!mcb_is_receiver()) {
+			if (mcb_is_sender())
+				update_sender_monitor(status, age_ms, rate);
+			else {
+				set_health_banner("<b>Setup required</b> — choose whether this is the gaming PC or stream PC.",
+					"#e6b450", "rgba(105,76,30,90)");
+				timing_summary_->setText("Open <b>Setup</b>, choose this PC's role, and apply once.");
+				suggestion_->setText("<b>Suggested:</b> Configure this PC before starting NDI output.");
+				monitor_numbers_->setText("No active bridge role.");
+			}
 			return;
+		}
 
 		auto &router = ReceiverRouter::instance();
 		const double receiver_age = router.last_packet_ns() && now >= router.last_packet_ns()
@@ -1388,59 +1770,59 @@ private:
 		else
 			channel_state = "waiting for audio";
 		receiver_status_->setText(
-			QString("%1 · split outputs %2/%3 · %4 · packet age %5 ms · packets %6 · suppressed %7 · "
-				"missing program %8 · missing mic %9")
-				.arg(router.attached() ? "ATTACHED" : "not attached")
-				.arg(router.outputs_ready() ? "created" : "missing")
-				.arg(router.outputs_active() ? "active" : "inactive")
+			QString("<b>%1</b> · split audio %2 · packet age %3 ms · missing desktop/mic %4/%5")
 				.arg(channel_state)
+				.arg(router.outputs_active() ? "active" : "not active")
 				.arg(receiver_age, 0, 'f', 1)
-				.arg(static_cast<qulonglong>(router.packets()))
-				.arg(static_cast<qulonglong>(router.suppressed()))
 				.arg(static_cast<qulonglong>(router.missing_program()))
 				.arg(static_cast<qulonglong>(router.missing_mic())));
 		program_meter_->setValue(meter_value(router.peak(0)));
 		mic_meter_->setValue(meter_value(router.peak(1)));
 
 		const auto governor = router.governor_snapshot();
-		QString governor_state = QString::fromUtf8(governor_phase_name(governor.phase));
-		if (governor.video_stalled)
-			governor_state = "VIDEO STALL — correction bypassed while re-locking";
-		const QString config_warning = governor.enabled && !governor.source_configured
-			? " · source settings not recommended"
-			: "";
-		const QString recovery_note = governor.phase == mcb::AVGovernorPhase::Holding ||
-			governor.phase == mcb::AVGovernorPhase::Relocking
-			? QString(" · %1 · re-lock %2/%3")
-				.arg(governor_reason_name(governor.reason))
-				.arg(governor.relock_progress).arg(governor.relock_required)
-			: "";
-		governor_status_->setText(
-			QString("%1 · delay/depth A/V %2/%3/%4 ms · skew raw/filtered/base %5/%6/%7 ms · "
-				"deviation %8 ms · drift %9 ppm (%10%) · video correction %11→%12 ms · "
-				"bypassed A/V decisions %13/%14 · recoveries %15 · fades %16/%17%18%19")
-				.arg(governor_state)
-				.arg(static_cast<double>(governor.playout_delay_ns) / 1e6, 0, 'f', 0)
-				.arg(static_cast<double>(governor.audio_playout_depth_ns) / 1e6, 0, 'f', 1)
-				.arg(static_cast<double>(governor.video_playout_depth_ns) / 1e6, 0, 'f', 1)
-				.arg(static_cast<double>(governor.raw_av_skew_ns) / 1e6, 0, 'f', 2)
-				.arg(static_cast<double>(governor.av_skew_ns) / 1e6, 0, 'f', 2)
-				.arg(static_cast<double>(governor.baseline_skew_ns) / 1e6, 0, 'f', 2)
-				.arg(static_cast<double>(governor.baseline_deviation_ns) / 1e6, 0, 'f', 2)
-				.arg(static_cast<qlonglong>(governor.drift_ppm)).arg(governor.drift_confidence)
-				.arg(static_cast<double>(governor.video_correction_ns) / 1e6, 0, 'f', 2)
-				.arg(static_cast<double>(governor.target_video_correction_ns) / 1e6, 0, 'f', 2)
-				.arg(static_cast<qulonglong>(governor.blocked_audio))
-				.arg(static_cast<qulonglong>(governor.blocked_video))
-				.arg(static_cast<qulonglong>(governor.atomic_recoveries))
-				.arg(static_cast<qulonglong>(governor.fade_out_packets))
-				.arg(static_cast<qulonglong>(governor.fade_in_packets))
-				.arg(recovery_note).arg(config_warning));
+		const double deviation = static_cast<double>(governor.baseline_deviation_ns) / 1e6;
+		const QString direction = std::fabs(deviation) < 2.0
+			? "aligned"
+			: deviation > 0.0 ? "audio ahead / video dragging" : "video ahead / audio dragging";
+		const QString drift = governor.drift_confidence >= 75
+			? QString("%1 ppm verified").arg(static_cast<qlonglong>(governor.drift_ppm))
+			: "still measuring";
+		governor_status_->setText(QString(
+			"<b>%1</b> · %2 by %3 ms<br>Trusted reference %4 ms · drift %5 · video correction %6 ms<br>"
+			"Recoveries %7 · failed %8 · quarantined samples %9")
+			.arg(QString::fromUtf8(governor_phase_name(governor.phase))).arg(direction)
+			.arg(std::fabs(deviation), 0, 'f', 1)
+			.arg(static_cast<double>(governor.baseline_skew_ns) / 1e6, 0, 'f', 1)
+			.arg(drift).arg(static_cast<double>(governor.video_correction_ns) / 1e6, 0, 'f', 2)
+			.arg(static_cast<qulonglong>(governor.atomic_recoveries))
+			.arg(static_cast<qulonglong>(governor.failed_recoveries))
+			.arg(static_cast<qulonglong>(governor.quarantined_samples)));
+		governor_status_->setStyleSheet(governor.fail_safe_bypassed
+			? "QLabel { color: #e05d5d; }"
+			: governor.phase == mcb::AVGovernorPhase::Locked
+				? "QLabel { color: #57c785; }"
+				: "QLabel { color: #5aa9e6; }");
+		update_receiver_monitor(router, governor, receiver_age);
+		if (configuration_panel_->isVisible())
+			refresh_source_context();
 
 	}
 
 	QRadioButton *sender_radio_ = nullptr;
 	QRadioButton *receiver_radio_ = nullptr;
+	QToolButton *setup_toggle_ = nullptr;
+	QToolButton *numbers_toggle_ = nullptr;
+	QWidget *configuration_panel_ = nullptr;
+	QWidget *monitor_panel_ = nullptr;
+	QWidget *monitor_numbers_panel_ = nullptr;
+	QLabel *health_banner_ = nullptr;
+	QLabel *timing_summary_ = nullptr;
+	QLabel *suggestion_ = nullptr;
+	QLabel *monitor_numbers_ = nullptr;
+	QLabel *monitor_program_label_ = nullptr;
+	QLabel *monitor_mic_label_ = nullptr;
+	QProgressBar *monitor_program_meter_ = nullptr;
+	QProgressBar *monitor_mic_meter_ = nullptr;
 	QCheckBox *confirm_ = nullptr;
 	QGroupBox *sender_box_ = nullptr;
 	QGroupBox *receiver_box_ = nullptr;
@@ -1455,6 +1837,8 @@ private:
 	QPushButton *refresh_ = nullptr;
 	QPushButton *reconnect_receiver_ = nullptr;
 	QPushButton *open_source_ = nullptr;
+	QPushButton *add_receiver_here_ = nullptr;
+	QLabel *source_context_ = nullptr;
 	QGroupBox *governor_box_ = nullptr;
 	QCheckBox *auto_configure_ = nullptr;
 	QCheckBox *advanced_governor_ = nullptr;
@@ -1487,7 +1871,9 @@ private:
 	QPushButton *export_diagnostics_ = nullptr;
 	QLabel *checklist_ = nullptr;
 	QTimer *timer_ = nullptr;
+	QTimer *safety_timer_ = nullptr;
 	uint64_t last_restart_ns_ = 0;
+	uint32_t auto_reconnect_attempts_ = 0;
 };
 
 BridgeDock *g_dock = nullptr;

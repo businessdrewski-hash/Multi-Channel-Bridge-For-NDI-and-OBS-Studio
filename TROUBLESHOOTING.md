@@ -50,12 +50,13 @@ The restart action recreates only the Multichannel DistroAV Main Output and pres
 ## Receiver has video but no split audio
 
 - Select Stream PC / Receiver.
-- Use one normal DistroAV NDI Source with audio enabled.
+- Use one normal DistroAV NDI Source with audio enabled and Source Behavior set to Keep Active.
 - Select that OBS source in the dock.
 - Create/repair both split sources.
 - Confirm four channels are detected and both proxy sources are active.
+- If another scene needs the receiver, use **Add this existing receiver to current scene**. Do not create a second independent receiver for the same NDI sender.
 
-## Governor remains WARMING UP or RELOCKING
+## Governor remains WARMING UP or VERIFYING
 
 - Click **Restore recommended settings**, then Apply.
 - Confirm Frame Sync is off and Source Timecode is selected.
@@ -63,7 +64,7 @@ The restart action recreates only the Multichannel DistroAV Main Output and pres
 - Confirm both split sources are active.
 - Restart Main Output and the receiver source after upgrading both PCs.
 
-The default lock requires at least 12 sane A/V observations collected over one second. Startup and recovery packets are held until both the sample count and baseline-learning time are satisfied.
+The initial trusted reference requires at least 12 sane observations over five stable seconds. After a fault, two seconds of samples are quarantined before a five-second recovery candidate is compared with that trusted reference. The adapter keeps normal DistroAV audio/video live during this process.
 
 ## Governor enters HOLDING
 
@@ -75,15 +76,19 @@ The live status and flight recorder identify the reason:
 - `A/V deviation exceeded`: movement beyond the hard limit from the learned baseline;
 - `shared playout depth left safe range`: the mapped OBS output timeline became implausibly far ahead of or behind local arrival time.
 
-Copy **Diagnostics** and **A/V flight recorder** before changing settings.
+Copy **Diagnostics** and **A/V flight recorder** before changing settings. Fault samples are excluded from baseline and drift learning.
 
 ## Audio/video briefly cuts during a fault
 
-This is intentional atomic recovery. Both paths are held rather than allowing one to keep advancing and create a permanent offset. A video stall gets one short audio fade-out packet; the first accepted audio packet after re-lock fades back in.
+The governor now fails open during warm-up, holding, verification, and failure, so its own timing decisions should not blank or mute the feed. If a cut remains, capture diagnostics: it is more likely in the sender, NDI transport, receiver, or OBS source lifecycle than an intentional governor gate.
+
+## Governor says NEEDS ATTENTION
+
+The recovered timing did not match the trusted reference, or more than three recoveries occurred within five minutes. Correction is bypassed and normal DistroAV output remains live. The dock attempts one in-place receiver reconnect; if the warning remains, follow its suggested action and export diagnostics before a manual reconnect or sender restart.
 
 ## Video correction remains at the configured maximum
 
-The measured source clocks are continuing to diverge beyond the correction range. Do not simply raise the value indefinitely. Copy the flight recorder and inspect audio devices, sender timing, network interruptions, and source restarts. A sustained error beyond the hard A/V limit will trigger a new epoch and re-lock.
+The measured source clocks are continuing to diverge beyond the correction range. Do not simply raise the value indefinitely. Copy the flight recorder and inspect audio devices, sender timing, network interruptions, and source restarts. The governor reports the limit instead of chasing the drift indefinitely.
 
 ## Fixed delay feels too high
 
@@ -97,6 +102,7 @@ Enable automatic configuration and Apply, or manually set:
 NDI Frame Sync: Off
 Sync mode: Source Timecode
 Audio: Enabled
+Source behavior: Keep Active
 ```
 
 The governor bypasses enforcement when these conditions are not met rather than risking false blocks.

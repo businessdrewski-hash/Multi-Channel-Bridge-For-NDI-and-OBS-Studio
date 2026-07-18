@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2 to DistroAV 6.2.1.
+"""Apply Multichannel Bridge for DistroAV v0.5.1-alpha1 to DistroAV 6.2.1.
 
 The resulting custom DistroAV package is installed on BOTH computers. The OBS
 Dock selects Gaming PC / Sender or Stream PC / Receiver.
@@ -13,7 +13,7 @@ performs no allocation and adds no callback mutex wait.
 Receiver mode intercepts DistroAV's raw planar NDI audio before OBS remixes it,
 then exposes channels 1-2 and 3-4 as two independent stereo OBS mixer sources.
 
-A/V Governor 1.2 observes the sender and receiver timing paths without replacing
+A/V Governor 1.3 observes the sender and receiver timing paths without replacing
 DistroAV's proven synthesized NDI transport timecodes. On the receiver it adds one shared playout delay, gently paces video timestamps
 for verified gradual drift, and atomically holds/re-locks both paths after stalls
 or timestamp discontinuities.
@@ -26,7 +26,7 @@ import re
 import shutil
 from pathlib import Path
 
-PATCH_MARKER = "Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2"
+PATCH_MARKER = "Multichannel Bridge for DistroAV v0.5.1-alpha1"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -244,7 +244,7 @@ def patch_ndi_output(path: Path) -> None:
     )
 
     state_types = r'''
-// Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2. SenderSyncCore owns all
+// Multichannel Bridge for DistroAV v0.5.1-alpha1. SenderSyncCore owns all
 // sample storage up front. The atomic flag is a non-blocking safety guard: OBS
 // normally serializes selected-mixer callbacks, but an unexpected concurrent
 // callback is dropped instead of waiting on the real-time audio thread.
@@ -514,16 +514,16 @@ def copy_bridge_files(root: Path, bridge_dir: Path) -> None:
 
 def write_notice(root: Path) -> None:
     (root / "MULTICHANNEL-BRIDGE.md").write_text(
-        "# Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix2\n\n"
+        "# Multichannel Bridge for DistroAV v0.5.1-alpha1\n\n"
         "Custom DistroAV 6.2.1 build. Install the same package on both PCs, then use "
         "Docks > Multichannel Bridge for DistroAV to select Gaming PC / Sender or Stream PC / Receiver.\n\n"
         "Sender defaults: OBS Track 5 -> NDI channels 1-2; OBS Track 6 -> channels 3-4.\n"
         "Receiver: one normal DistroAV NDI Source provides video while the bridge exposes the two stereo "
         "pairs as independent OBS audio-only sources.\n\n"
         "Sender Sync Core 2.0 uses fixed preallocated audio storage, canonical mix-interval timestamps, "
-        "automatic discontinuity re-anchoring, and no blocking callback lock. A/V Governor 1.2 uses "
+        "automatic discontinuity re-anchoring, and no blocking callback lock. A/V Governor 1.3 uses "
         "DistroAV's synthesized transport timecodes, one shared playout delay, bounded video pacing, "
-        "and fail-open re-lock recovery after stalls or timestamp jumps. It is optional and enabled by default.\n\n"
+        "and trusted-reference recovery with fail-safe bypass after stalls or timestamp jumps. It is optional and enabled by default.\n\n"
         "Experimental. Not affiliated with or endorsed by DistroAV. DistroAV remains GPL-2.0-or-later.\n",
         encoding="utf-8",
         newline="\n",
@@ -557,7 +557,7 @@ def verify(root: Path) -> None:
         "mcb_receiver_route_audio(obs_source, obs_audio_frame, channelCount,",
         "mcb_receiver_route_video(obs_source, obs_video_frame,",
         "NDIlib_send_timecode_synthesize",
-        'kGovernorVersion = "1.2"',
+        'kGovernorVersion = "1.3"',
         "GovernorPlayoutDelayMs",
         "governor_flight_recorder_csv",
         "mcb_receiver_route_video",

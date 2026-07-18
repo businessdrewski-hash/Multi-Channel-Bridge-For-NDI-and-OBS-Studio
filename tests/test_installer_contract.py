@@ -16,6 +16,8 @@ workflow_markers = (
     "Installer does not have a Windows PE MZ header",
     "gh release create",
     "Multichannel-Bridge-for-DistroAV-Setup-v${{ steps.version.outputs.version }}.exe",
+    "Test installer state on Windows PowerShell 5.1",
+    "shell: powershell",
 )
 for marker in workflow_markers:
     if marker not in workflow:
@@ -37,9 +39,13 @@ helper_markers = (
     "pending-install-rollback",
     "Write-InstallResult $failureMessage",
     "Rollback completed.",
+    "disabled_duplicate_installations = $disabledDuplicates.ToArray()",
 )
 for marker in helper_markers:
     if marker not in helper:
         raise SystemExit(f"Install helper safety contract is missing: {marker}")
+
+if "disabled_duplicate_installations = @($disabledDuplicates)" in helper:
+    raise SystemExit("Windows PowerShell 5.1-incompatible generic-list array conversion returned")
 
 print("Installer and EXE delivery audit passed")

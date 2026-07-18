@@ -10,7 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $productName = 'Multichannel Bridge for DistroAV'
-$version = '0.5.0-alpha1-buildfix2'
+$version = '0.5.1-alpha1'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $stateRoot = Join-Path $env:ProgramData $productName
 $legacyStateRoot = Join-Path $env:ProgramData 'NDI-Multichannel-Bridge'
@@ -305,7 +305,10 @@ try {
         installed_dll = $installedDll
         installed_dll_sha256 = $installedHash
         plugin_manager_reset = $pluginManagerReset
-        disabled_duplicate_installations = @($disabledDuplicates)
+        # Windows PowerShell 5.1 can throw "Argument types do not match" when
+        # array-subexpression syntax enumerates a generic List[object]. Convert
+        # explicitly so both empty and populated lists serialize reliably.
+        disabled_duplicate_installations = $disabledDuplicates.ToArray()
     }
     $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
 

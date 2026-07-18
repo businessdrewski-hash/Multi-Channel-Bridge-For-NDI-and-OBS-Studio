@@ -1,7 +1,7 @@
 # Multichannel Bridge for DistroAV
 
 > Experimental modified DistroAV build for two-PC OBS setups
-> Current version: **0.5.0-alpha1-buildfix2**
+> Current version: **0.5.1-alpha1**
 > Based on: **DistroAV 6.2.1**
 
 ## Personal project and support disclaimer
@@ -53,7 +53,7 @@ It:
 
 OBS has already converted selected tracks onto its own audio engine clock before the bridge receives them. The sender core therefore aligns OBS mix blocks without adding another resampler or attempting to infer hardware drift from callback arrival time.
 
-## A/V Governor 1.2
+## A/V Governor 1.3
 
 The optional receiver-side timing guard runs before DistroAV submits received media to OBS.
 
@@ -61,13 +61,15 @@ It:
 
 - captures raw incoming NDI timestamp/timecode values beside the OBS timestamps produced by DistroAV;
 - projects audio and video to one common local instant and median-filters short arrival jitter;
-- learns the normal fixed A/V offset over a configurable baseline window;
+- learns an initial trusted A/V reference only after at least five stable seconds;
 - maps both streams onto the same future OBS playout timeline, using OBS's native asynchronous source queues instead of copying 4K video frames into another buffer;
 - estimates gradual drift only after a sustained, high-confidence trend is present;
 - keeps audio sample-perfect and applies bounded corrections only to video timestamps at video-frame boundaries;
-- re-locks its internal timing model after stalls, backward/repeated timestamps, large jumps, unsafe playout depth, or excessive movement away from baseline;
-- fails open with normal DistroAV timestamps while warming up or re-locking, so timing protection cannot blank a live feed;
-- exports a bounded CSV flight recorder and plain-text diagnostic bundle.
+- quarantines samples after stalls, backward/repeated timestamps, large jumps, unsafe playout depth, or excessive movement away from the trusted reference;
+- verifies recovered timing against the last trusted reference instead of accepting a post-fault offset as the new normal;
+- makes one in-place receiver reconnect attempt even when the dock is hidden, then fails open with normal DistroAV timestamps if safe recovery cannot be verified;
+- protects critical fault/recovery events from being overwritten by routine CSV telemetry;
+- presents a compact, color-coded health summary while keeping exact numbers and setup independently collapsible.
 
 The governor does not PPM-adjust, resample, stretch, or cut audio. See [`AV-GOVERNOR.md`](AV-GOVERNOR.md) for detailed behavior and limitations.
 
@@ -93,7 +95,7 @@ flowchart LR
 
     subgraph S[Stream PC]
         R[DistroAV NDI Source\nFrame Sync off + Source Timecode]
-        G1[A/V Governor 1.2\nFiltered timeline + video pacing + atomic re-lock]
+        G1[A/V Governor 1.3\nTrusted reference + quarantined recovery + fail-safe bypass]
         X[Receiver splitter\nBefore OBS downmix]
         P[MCB Desktop / Game\nChannels 1-2]
         MIC[MCB Microphone\nChannels 3-4]
@@ -117,19 +119,23 @@ flowchart LR
 - Automatic sender epoch re-anchor after timestamp discontinuities
 - One-click sender re-anchor and full NDI Main Output restart
 - No callback-time bridge allocation, queue growth, UI work, or added packing lock
-- Robust median baseline learning and projected A/V comparison
+- Stable five-second trusted-reference learning and projected A/V comparison
 - Raw NDI timing fields recorded beside converted OBS timestamps
 - Shared configurable OBS-native playout timeline
-- Confidence-gated, frame-boundary video-only drift correction
-- Fail-open timed re-lock after stalls or timestamp discontinuities
+- Confidence-gated video-only drift correction after at least 30 seconds of one-direction evidence
+- Two-second fault-sample quarantine and recovery verification against the trusted reference
+- Fail-safe bypass if recovery differs materially from the trusted reference or repeatedly fails
 - Fade-assisted audio boundaries during recovery
 - Monotonic epoch rebasing after sender/source clock restarts
-- Fixed-size A/V flight recorder with one-click diagnostic export
+- Protected critical-event and rate-limited telemetry flight recorders with one-click export
 - Four-block fixed sender audio queues and preallocated silence fallback
 - Duplicate combined-audio suppression
+- One canonical receiver source with an add-existing-reference action for other scenes
 - In-place receiver reconnect after upgrades without deleting the OBS source
 - Split proxy sources explicitly marked audio-active; Create / repair fixes mute, zero volume, and empty mixer routing
-- Live sender, receiver, and governor diagnostics
+- Compact color-coded monitoring, plain-language rushing/dragging direction, and brief suggested actions
+- Exact sender, receiver, and governor numbers available in a separate collapsible panel
+- Floating bridge windows inherit the normal OBS application icon
 - One package for both PCs with beginner-friendly role selection
 - Windows EXE installer with backup, duplicate cleanup, hash verification, upgrade support, and uninstall restoration
 
@@ -159,7 +165,7 @@ Compatibility outside that environment is not guaranteed.
 
 Install the same release on both computers.
 
-1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix2.exe`.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.1-alpha1.exe`.
 2. Close OBS completely.
 3. Run the installer as Administrator on both PCs.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
@@ -200,16 +206,17 @@ Recommended governor defaults:
 Shared playout delay:             120 ms
 Hard A/V deviation limit:         120 ms
 Video-stall hold threshold:       120 ms
-Baseline learning window:        1000 ms
-Drift analysis window:          30000 ms
-Minimum drift observation:      10000 ms
+Baseline learning window:        5000 ms
+Drift analysis window:         120000 ms
+Minimum drift observation:      30000 ms
 Drift deadband:                     8 ppm
 Gradual video correction:         On
 Maximum video correction:          40 ms
 Video correction slew:           1000 ppm
-Atomic re-lock samples:            12
+Minimum recovery observations:     12
 NDI Frame Sync:                    Off
 Sync mode:                         Source Timecode
+NDI source behavior:               Keep Active
 ```
 
 ---
@@ -248,7 +255,7 @@ A nonzero learned baseline is not automatically a problem. The governor protects
 
 ## Troubleshooting
 
-### Governor remains WARMING UP or RELOCKING
+### Governor remains WARMING UP or VERIFYING
 
 - Confirm the selected source is the combined bridge feed.
 - Confirm four audio channels are detected.
@@ -258,7 +265,15 @@ A nonzero learned baseline is not automatically a problem. The governor protects
 
 ### Governor enters HOLDING
 
-The status line reports the reason. Common causes are video stall, backward/repeated timestamp, large timestamp jump, or A/V movement beyond the hard limit. Copy diagnostics and the A/V flight recorder before changing settings.
+The status line reports the reason. Common causes are video stall, backward/repeated timestamp, large timestamp jump, or A/V movement beyond the hard limit. Normal DistroAV output remains live while fault samples are quarantined. Copy diagnostics and the A/V flight recorder before changing settings.
+
+### Governor says NEEDS ATTENTION
+
+Automatic correction has failed open because recovered timing did not safely match the trusted reference or too many recoveries occurred. The bridge makes one in-place receiver reconnect attempt; if the warning remains, use the brief suggested action, then export diagnostics before manually reconnecting or restarting the sender.
+
+### One scene has video but no split audio
+
+Do not create multiple independent DistroAV receiver objects for the same sender. Choose the one working receiver in Setup, then use **Add this existing receiver to current scene** everywhere else. The same OBS source reference can be shared safely across scenes.
 
 ### Audio briefly cuts during a fault
 
@@ -277,6 +292,24 @@ More detail: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
 ---
 
 ## Consolidated changelog
+
+### 0.5.1-alpha1
+
+- Preserves a last-known-good A/V reference through jumps and reconnects instead of learning the fault as a new baseline.
+- Requires at least five stable seconds for baseline acceptance, quarantines two seconds of post-fault samples, and verifies recovery against the trusted reference.
+- Waits at least 30 seconds before acting on gradual drift and adds correction hysteresis and limit reporting.
+- Fails open after an unsafe candidate or repeated recovery attempts and performs at most one automatic in-place receiver reconnect, even with the dock hidden.
+- Splits the flight recorder into protected critical events and rate-limited telemetry so fault evidence survives long sessions.
+- Adds a compact, color-coded monitor with plain-language rushing/dragging direction, a short recommendation, and independently collapsible Setup and Numbers panels.
+- Detects duplicate DistroAV receiver objects and adds one canonical existing receiver to other scenes by reference.
+- Applies Keep Active, Source Timecode, Frame Sync off, and audio enabled as the recommended receiver configuration.
+- Makes floating bridge windows inherit the normal OBS application icon.
+- Retains the buildfix3 PowerShell 5.1 installer-state correction and rollback behavior.
+
+### 0.5.0-alpha1-buildfix3
+
+- Fixed the Windows PowerShell 5.1 installation-state serialization failure that reported `Argument types do not match` after file verification.
+- Keeps the buildfix2 pre-install snapshot and automatic rollback behavior.
 
 ### 0.5.0-alpha1-buildfix2
 

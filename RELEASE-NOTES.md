@@ -1,4 +1,36 @@
-# v0.5.0-alpha1-buildfix2 release notes
+# v0.5.1-alpha1 release notes
+
+## Trusted recovery and drift safety
+
+- Keeps the last trusted A/V reference across discontinuities and receiver reconnects.
+- Requires five stable seconds before accepting the initial reference or a recovery candidate.
+- Quarantines two seconds of observations after a fault so a jump cannot contaminate baseline or drift calculations.
+- Rejects a recovered offset that differs materially from the trusted reference instead of silently declaring it normal.
+- Requires at least 30 seconds of persistent drift evidence, with entry/exit hysteresis, before pacing video timestamps.
+- Reports when correction reaches its safe limit.
+- Performs one automatic in-place receiver reconnect even when the dock is hidden, then fails open and stops automatic interference if safe recovery cannot be verified or recovery repeats too often.
+
+## Compact monitoring and receiver QOL
+
+- Replaces the wall of governor statistics with a compact color-coded health banner, plain-language rushing/dragging direction, track meters, and a one-line suggested action.
+- Keeps exact values available in a separately collapsible **Numbers** panel and setup controls in a separately collapsible **Setup** panel.
+- Renames technical status text around trusted reference, clock-domain offset, recovery, and verification.
+- Detects multiple DistroAV receiver objects for the selected sender and warns that only one should own the split audio path.
+- Adds **Add this existing receiver to current scene**, which reuses the canonical OBS source rather than opening another NDI connection.
+- Applies Keep Active alongside Frame Sync off, Source Timecode, and audio enabled in recommended receiver settings.
+- Makes floating bridge windows inherit OBS's normal application icon instead of the generic blank-page icon.
+
+## Protected diagnostics
+
+- Splits the fixed flight recorder into protected critical-event capacity and rate-limited telemetry capacity.
+- Prevents routine correction updates from overwriting the jump, hold, verification, lock, or failure evidence needed for diagnosis.
+- Adds trusted reference, recovery candidate, clock-domain offset, and fail-safe state to CSV export.
+
+## Buildfix3 installer correction
+
+- Fixed a Windows PowerShell 5.1 incompatibility while saving `install-state.json`.
+- Explicitly converts the tracked duplicate-installation list to an array before JSON serialization, avoiding the post-verification `Argument types do not match` failure.
+- Retains the verified buildfix2 rollback path; a failed attempt restores the DistroAV files that were present immediately before installation.
 
 ## Buildfix 2
 
@@ -52,7 +84,7 @@ The two selected OBS tracks are already rendered by the same OBS audio engine be
 
 ## Receiver behavior
 
-A/V Governor 1.2 and the two split receiver sources remain available. The four-channel mapping remains unchanged:
+A/V Governor 1.3 and the two split receiver sources remain available. The four-channel mapping remains unchanged:
 
 ```text
 OBS Track A -> NDI channels 1-2 -> Desktop / Game
@@ -64,8 +96,8 @@ OBS Track B -> NDI channels 3-4 -> Microphone
 The GitHub Action builds:
 
 ```text
-Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix2.exe
-Multichannel-Bridge-for-DistroAV-v0.5.0-alpha1-buildfix2-Portable-Windows-x64.zip
+Multichannel-Bridge-for-DistroAV-Setup-v0.5.1-alpha1.exe
+Multichannel-Bridge-for-DistroAV-v0.5.1-alpha1-Portable-Windows-x64.zip
 Multichannel-Bridge-DistroAV-6.2.1.patch
 SHA256SUMS.txt
 ```

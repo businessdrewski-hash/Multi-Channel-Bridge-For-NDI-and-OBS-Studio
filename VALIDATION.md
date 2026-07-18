@@ -1,4 +1,4 @@
-# Validation notes for v0.5.0-alpha1-buildfix2
+# Validation notes for v0.5.1-alpha1
 
 Completed in the source-generation environment:
 
@@ -6,10 +6,11 @@ Completed in the source-generation environment:
 - GitHub Actions workflow YAML parse validation
 - Sender Sync Core 2.0 C++17 compilation with `-Wall -Wextra -Werror`
 - Sender tests for canonical mix timestamps, 10,000-cycle bounded pairing, backward timestamp recovery, manual re-anchor, missing-track silence fallback, oversized input rejection, and the one-megabyte state-size ceiling
-- A/V Governor 1.2 C++17 compilation and existing standalone recovery tests
+- A/V Governor 1.3 C++17 trusted-baseline, quarantine, fail-safe, drift, and protected-recorder tests
 - Static game-PC callback audit rejecting dynamic containers, allocation/growth calls, mutex waits, UI work, file work, and callback logging
 - Parameter-path audit covering defaults, reads/runtime paths, and writes for all 20 saved settings
 - Repository version and required-file checks
+- Windows PowerShell 5.1 execution test for empty and populated installer-state serialization
 
 Design properties enforced by code and release tests:
 
@@ -18,8 +19,15 @@ Design properties enforced by code and release tests:
 - UI/control actions use atomic generation requests.
 - Sender queues have a fixed four-block ceiling.
 - Receiver timing recovery fails open, preserves synthesized NDI transport timecodes, and cannot blank a live feed.
+- A trusted A/V reference cannot be replaced by a mismatched post-fault candidate.
+- Recovery samples are quarantined and gradual drift requires at least 30 seconds of evidence.
+- Repeated or mismatched recovery enters fail-safe bypass instead of looping corrections or resets.
+- Critical flight-recorder events have protected capacity and cannot be overwritten by routine correction telemetry.
 - Receiver proxy sources are audio-active and explicit repair clears mute/zero-volume/empty-routing states.
-- Existing DistroAV receiver sources expose an in-place reconnect procedure.
+- Existing DistroAV receiver sources expose an in-place reconnect procedure and only one automatic reconnect is attempted during fail-safe recovery, including while the dock is hidden.
+- The receiver configuration prefers one canonical Keep Active source that is shared into other scenes by reference.
+- The compact monitor exposes health, rushing/dragging direction, a brief recommendation, and collapsible exact numbers.
+- Floating bridge windows inherit the OBS application icon.
 - Monitoring peak scans and the dock timer stop while the dock is hidden.
 - Receiver fade scratch storage is fixed-size.
 

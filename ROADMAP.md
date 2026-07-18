@@ -1,20 +1,23 @@
 # Roadmap
 
-## Implemented through 0.5.0-alpha1-buildfix2
+## Implemented through 0.5.1-alpha1
 
-- Robust baseline learning and median jitter filtering
-- High-confidence drift-rate estimation
+- Stable trusted-reference learning, sample quarantine, and median jitter filtering
+- High-confidence drift-rate estimation after at least 30 seconds of persistent evidence
 - Frame-boundary, video-only timing correction
 - Shared OBS-native playout timeline
-- Atomic epoch recovery with audio fade boundaries
+- Trusted-reference recovery verification with fail-safe bypass and audio fade boundaries
 - Raw NDI-versus-OBS timing capture
-- Diagnostic bundle export
+- Protected critical-event and rate-limited telemetry diagnostic export
 - Reviewable DistroAV patch artifact
 - Windows EXE installer workflow
 - Fixed-capacity, preallocated Sender Sync Core 2.0
 - Canonical mix-interval timestamps and automatic sender re-anchor
 - One-click sender re-anchor and complete Bridge restart
 - Hidden-dock monitoring suspension and callback-safety release gates
+- Compact color-coded monitoring with rushing/dragging direction, brief recommendations, and collapsible exact numbers
+- Canonical Keep Active receiver reuse across scenes and duplicate-receiver warnings
+- Normal OBS icon inheritance for floating bridge windows
 
 ## Next validation work
 

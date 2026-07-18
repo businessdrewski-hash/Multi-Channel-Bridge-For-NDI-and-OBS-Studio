@@ -1,10 +1,10 @@
 # Install on both PCs
 
-Install the same `0.5.0-alpha1-buildfix2` package on the gaming PC and stream PC.
+Install the same `0.5.1-alpha1` package on the gaming PC and stream PC.
 
 ## Recommended EXE installation
 
-1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix2.exe`.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.1-alpha1.exe`.
 2. Close OBS completely.
 3. Run setup as Administrator.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
@@ -26,7 +26,7 @@ The installer backs up DistroAV, removes obsolete bridge files, disables common 
 
 ## Stream PC
 
-1. Add one normal DistroAV NDI Source for the gaming-PC Main Output.
+1. Add one normal DistroAV NDI Source for the gaming-PC Main Output. This is the canonical receiver.
 2. Select **Stream PC / Receiver** in the bridge dock.
 3. Select that OBS source.
 4. Leave A/V Governor and automatic source timing enabled.
@@ -34,6 +34,7 @@ The installer backs up DistroAV, removes obsolete bridge files, disables common 
 6. Confirm `MCB Desktop / Game` and `MCB Microphone` appear separately.
 7. Keep original-audio suppression enabled.
 8. Confirm the governor reaches `LOCKED`.
+9. For other scenes, select the same receiver and use **Add this existing receiver to current scene**. Do not create another independent DistroAV receiver object for the same sender.
 
 Recommended receiver timing is applied automatically:
 
@@ -41,12 +42,16 @@ Recommended receiver timing is applied automatically:
 NDI Frame Sync: Off
 Sync mode: Source Timecode
 Audio: Enabled
+Source behavior: Keep Active
 Shared playout delay: 120 ms
 Gradual video correction: On
-Atomic re-lock samples: 12 over at least 1 second
+Trusted reference time: at least 5 stable seconds
+Post-fault quarantine: 2 seconds
+Minimum drift evidence: 30 seconds
+Minimum recovery observations: 12
 ```
 
-After setup, confirm the governor reaches `LOCKED`. Use **Copy A/V flight recorder** immediately after any jump, stall, or unexpected cut.
+After setup, collapse **Setup** and leave the compact monitor visible. Expand **Numbers** only when you want exact timing values. Use **Copy A/V flight recorder** immediately after any jump, stall, or unexpected cut.
 
 ## Uninstall
 

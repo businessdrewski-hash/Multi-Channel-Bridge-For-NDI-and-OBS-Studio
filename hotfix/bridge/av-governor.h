@@ -13,7 +13,8 @@ enum class AVGovernorPhase : uint8_t {
 	WarmingUp,
 	Locked,
 	Holding,
-	Relocking,
+	Verifying,
+	Failed,
 };
 
 enum class AVGovernorReason : uint8_t {
@@ -28,6 +29,8 @@ enum class AVGovernorReason : uint8_t {
 	PlayoutDepthExceeded,
 	SourceReconfigured,
 	ManualReset,
+	BaselineMismatch,
+	RecoveryLimit,
 };
 
 struct AVGovernorDecision {
@@ -44,11 +47,15 @@ struct AVGovernorSnapshot {
 	bool video_stalled = false;
 	bool baseline_valid = false;
 	bool drift_correction_enabled = true;
+	bool fail_safe_bypassed = false;
+	bool correction_limited = false;
+	bool verifying_trusted_baseline = false;
 	AVGovernorPhase phase = AVGovernorPhase::Bypassed;
 	AVGovernorReason reason = AVGovernorReason::None;
 	int64_t raw_av_skew_ns = 0;
 	int64_t av_skew_ns = 0;
 	int64_t baseline_skew_ns = 0;
+	int64_t candidate_baseline_skew_ns = 0;
 	int64_t baseline_deviation_ns = 0;
 	int64_t video_correction_ns = 0;
 	int64_t target_video_correction_ns = 0;
@@ -69,6 +76,8 @@ struct AVGovernorSnapshot {
 	uint64_t discontinuities = 0;
 	uint64_t lock_acquisitions = 0;
 	uint64_t atomic_recoveries = 0;
+	uint64_t failed_recoveries = 0;
+	uint64_t quarantined_samples = 0;
 	uint64_t correction_updates = 0;
 	uint64_t monotonic_clamps = 0;
 	uint64_t fade_out_packets = 0;
@@ -100,8 +109,8 @@ class AVGovernor {
 public:
 	void configure(bool enabled, int max_deviation_ms, int video_stall_ms,
 		int playout_delay_ms, bool drift_correction, int max_video_correction_ms,
-		int correction_slew_ppm, int relock_pairs, int baseline_window_ms = 1000,
-		int drift_window_ms = 30000, int drift_minimum_ms = 10000,
+		int correction_slew_ppm, int relock_pairs, int baseline_window_ms = 5000,
+		int drift_window_ms = 120000, int drift_minimum_ms = 30000,
 		int drift_deadband_ppm = 8);
 	void set_source_configured(bool configured);
 	void reset(bool reset_counters);
@@ -115,7 +124,7 @@ public:
 
 private:
 	enum class Stream : uint8_t { Audio = 0, Video = 1 };
-	enum class EventType : uint8_t { Sample = 0, Hold, Lock, Correction, Drop, Reset, Fade };
+	enum class EventType : uint8_t { Sample = 0, Hold, Lock, Correction, Drop, Reset, Fade, Failed };
 
 	struct TrendSample {
 		uint64_t arrival_ns = 0;
@@ -133,6 +142,8 @@ private:
 		int64_t raw_ndi_timecode_100ns = 0;
 		int64_t raw_skew_ns = 0;
 		int64_t skew_ns = 0;
+		int64_t trusted_baseline_ns = 0;
+		int64_t candidate_baseline_ns = 0;
 		int64_t deviation_ns = 0;
 		int64_t correction_ns = 0;
 		int64_t rebase_ns = 0;
@@ -144,17 +155,21 @@ private:
 		EventType type = EventType::Sample;
 		Stream stream = Stream::Audio;
 		bool accepted = false;
+		bool fail_safe_bypassed = false;
 	};
 
-	static constexpr size_t kRecorderCapacity = 1024;
+	static constexpr size_t kCriticalRecorderCapacity = 128;
+	static constexpr size_t kTelemetryRecorderCapacity = 896;
 	static constexpr size_t kBaselineCapacity = 128;
 	static constexpr size_t kSkewFilterCapacity = 9;
-	static constexpr size_t kTrendCapacity = 128;
+	static constexpr size_t kTrendCapacity = 512;
 	static constexpr size_t kVideoIntervalCapacity = 17;
 	static uint64_t ns_from_ms(int value);
 	static uint64_t magnitude(int64_t value);
 	static bool source_discontinuity(uint64_t previous, uint64_t current);
 	static int64_t median(std::array<int64_t, kBaselineCapacity> values, size_t count);
+	static uint64_t median_absolute_deviation(std::array<int64_t, kBaselineCapacity> values,
+		size_t count, int64_t center);
 	static int64_t median_small(std::array<int64_t, kSkewFilterCapacity> values, size_t count);
 	static uint64_t median_intervals(std::array<uint64_t, kVideoIntervalCapacity> values, size_t count);
 	static const char *phase_name(AVGovernorPhase phase);
@@ -162,8 +177,9 @@ private:
 	static const char *event_name(EventType type);
 	static const char *stream_name(Stream stream);
 
-	void reset_locked(bool reset_counters, AVGovernorReason reason);
+	void reset_locked(bool reset_counters, AVGovernorReason reason, bool preserve_trusted_baseline = false);
 	void enter_hold_locked(AVGovernorReason reason, uint64_t arrival_ns);
+	void enter_failed_locked(AVGovernorReason reason, uint64_t arrival_ns);
 	bool observe_pair_locked(uint64_t arrival_ns);
 	void update_skew_locked();
 	void push_skew_filter_locked(int64_t skew_ns);
@@ -186,10 +202,14 @@ private:
 	uint64_t video_stall_ns_ = 120000000ULL;
 	uint64_t max_video_correction_ns_ = 40000000ULL;
 	uint64_t acquisition_limit_ns_ = 400000000ULL;
-	uint64_t baseline_window_ns_ = 1000000000ULL;
-	uint64_t drift_window_ns_ = 30000000000ULL;
-	uint64_t drift_minimum_ns_ = 10000000000ULL;
+	uint64_t baseline_window_ns_ = 5000000000ULL;
+	uint64_t drift_window_ns_ = 120000000000ULL;
+	uint64_t drift_minimum_ns_ = 30000000000ULL;
 	uint64_t trend_sample_interval_ns_ = 250000000ULL;
+	uint64_t quarantine_ns_ = 2000000000ULL;
+	uint64_t baseline_stability_limit_ns_ = 8000000ULL;
+	uint64_t recovery_match_limit_ns_ = 40000000ULL;
+	uint64_t recovery_limit_window_ns_ = 300000000000ULL;
 	uint32_t correction_slew_ppm_ = 1000;
 	uint32_t drift_deadband_ppm_ = 8;
 	uint32_t relock_required_ = 3;
@@ -198,6 +218,13 @@ private:
 	uint64_t paired_audio_sequence_ = 0;
 	uint64_t paired_video_sequence_ = 0;
 	uint64_t baseline_start_arrival_ns_ = 0;
+	uint64_t quarantine_until_ns_ = 0;
+	uint64_t stable_lock_start_ns_ = 0;
+	uint64_t recovery_window_start_ns_ = 0;
+	uint32_t recovery_attempts_ = 0;
+	bool acquiring_initial_baseline_ = true;
+	bool start_quarantine_on_next_pair_ = false;
+	bool drift_confirmed_ = false;
 	std::array<int64_t, kBaselineCapacity> baseline_samples_{};
 	size_t baseline_count_ = 0;
 	std::array<int64_t, kSkewFilterCapacity> skew_filter_{};
@@ -214,10 +241,16 @@ private:
 	uint64_t last_output_audio_ns_ = 0;
 	uint64_t last_output_video_ns_ = 0;
 	uint64_t last_record_sample_ns_ = 0;
+	uint64_t last_record_correction_ns_ = 0;
+	int64_t last_recorded_correction_ns_ = 0;
+	int64_t last_recorded_target_ns_ = 0;
 	bool fade_in_pending_ = false;
-	std::array<Event, kRecorderCapacity> events_{};
-	size_t event_write_ = 0;
-	size_t event_count_ = 0;
+	std::array<Event, kCriticalRecorderCapacity> critical_events_{};
+	std::array<Event, kTelemetryRecorderCapacity> telemetry_events_{};
+	size_t critical_write_ = 0;
+	size_t critical_count_ = 0;
+	size_t telemetry_write_ = 0;
+	size_t telemetry_count_ = 0;
 };
 
 } // namespace mcb
