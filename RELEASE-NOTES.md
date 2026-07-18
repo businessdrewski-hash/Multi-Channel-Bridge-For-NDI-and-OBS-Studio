@@ -1,4 +1,9 @@
-# v0.5.0-alpha1 release notes
+# v0.5.0-alpha1-buildfix1 release notes
+
+## Buildfix 1
+
+- Marked supplemental Markdown documents as optional installer inputs, so a missing `AV-GOVERNOR.md` cannot abort Inno Setup compilation.
+- Added a staged-package manifest check that fails early and clearly if a runtime-critical DLL, script, readme, or license file is missing.
 
 ## Lightweight Sender Sync Core 2.0
 
@@ -45,8 +50,8 @@ OBS Track B -> NDI channels 3-4 -> Microphone
 The GitHub Action builds:
 
 ```text
-Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1.exe
-Multichannel-Bridge-for-DistroAV-v0.5.0-alpha1-Portable-Windows-x64.zip
+Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix1.exe
+Multichannel-Bridge-for-DistroAV-v0.5.0-alpha1-buildfix1-Portable-Windows-x64.zip
 Multichannel-Bridge-DistroAV-6.2.1.patch
 SHA256SUMS.txt
 ```

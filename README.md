@@ -1,7 +1,7 @@
 # Multichannel Bridge for DistroAV
 
 > Experimental modified DistroAV build for two-PC OBS setups
-> Current version: **0.5.0-alpha1**
+> Current version: **0.5.0-alpha1-buildfix1**
 > Based on: **DistroAV 6.2.1**
 
 ## Personal project and support disclaimer
@@ -157,7 +157,7 @@ Compatibility outside that environment is not guaranteed.
 
 Install the same release on both computers.
 
-1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1.exe`.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.5.0-alpha1-buildfix1.exe`.
 2. Close OBS completely.
 3. Run the installer as Administrator on both PCs.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
@@ -275,6 +275,11 @@ More detail: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
 ---
 
 ## Consolidated changelog
+
+### 0.5.0-alpha1-buildfix1
+
+- Fixed Windows installer compilation when optional documentation such as `AV-GOVERNOR.md` is absent from the staged package.
+- Added explicit staged-package validation for every runtime-critical installer input.
 
 ### 0.5.0-alpha1
 

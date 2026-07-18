@@ -7,7 +7,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-if version != "0.5.0-alpha1":
+if version != "0.5.0-alpha1-buildfix1":
     raise SystemExit(f"Unexpected VERSION: {version}")
 
 checks = {
@@ -23,6 +23,17 @@ for relative, marker in checks.items():
     text = (ROOT / relative).read_text(encoding="utf-8")
     if marker not in text:
         raise SystemExit(f"Version marker missing from {relative}: {marker}")
+
+installer = (ROOT / "installer/MultichannelBridge.iss").read_text(encoding="utf-8")
+for optional_doc in ("INSTALL-BOTH-PCS.md", "RELEASE-NOTES.md", "AV-GOVERNOR.md", "UPSTREAM-NOTES.md", "ROADMAP.md"):
+    matching_lines = [line for line in installer.splitlines() if optional_doc in line and line.startswith("Source:")]
+    if len(matching_lines) != 1 or "skipifsourcedoesntexist" not in matching_lines[0]:
+        raise SystemExit(f"Optional installer document is not safely skippable: {optional_doc}")
+
+workflow = (ROOT / ".github/workflows/build-windows.yml").read_text(encoding="utf-8")
+for marker in ("$optionalDocs = @(", "$requiredPackagePaths = @(", "Required staged installer input is missing"):
+    if marker not in workflow:
+        raise SystemExit(f"Workflow staging guard is missing: {marker}")
 
 required = (
     ".github/workflows/build-windows.yml",

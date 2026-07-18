@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply Multichannel Bridge for DistroAV v0.5.0-alpha1 to DistroAV 6.2.1.
+"""Apply Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1 to DistroAV 6.2.1.
 
 The resulting custom DistroAV package is installed on BOTH computers. The OBS
 Dock selects Gaming PC / Sender or Stream PC / Receiver.
@@ -26,7 +26,7 @@ import re
 import shutil
 from pathlib import Path
 
-PATCH_MARKER = "Multichannel Bridge for DistroAV v0.5.0-alpha1"
+PATCH_MARKER = "Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -218,7 +218,7 @@ def patch_ndi_output(path: Path) -> None:
     )
 
     state_types = r'''
-// Multichannel Bridge for DistroAV v0.5.0-alpha1. SenderSyncCore owns all
+// Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1. SenderSyncCore owns all
 // sample storage up front. The atomic flag is a non-blocking safety guard: OBS
 // normally serializes selected-mixer callbacks, but an unexpected concurrent
 // callback is dropped instead of waiting on the real-time audio thread.
@@ -495,7 +495,7 @@ def copy_bridge_files(root: Path, bridge_dir: Path) -> None:
 
 def write_notice(root: Path) -> None:
     (root / "MULTICHANNEL-BRIDGE.md").write_text(
-        "# Multichannel Bridge for DistroAV v0.5.0-alpha1\n\n"
+        "# Multichannel Bridge for DistroAV v0.5.0-alpha1-buildfix1\n\n"
         "Custom DistroAV 6.2.1 build. Install the same package on both PCs, then use "
         "Docks > Multichannel Bridge for DistroAV to select Gaming PC / Sender or Stream PC / Receiver.\n\n"
         "Sender defaults: OBS Track 5 -> NDI channels 1-2; OBS Track 6 -> channels 3-4.\n"

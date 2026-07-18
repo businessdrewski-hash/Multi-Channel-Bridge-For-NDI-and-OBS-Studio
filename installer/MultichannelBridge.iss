@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.5.0-alpha1"
+  #define AppVersion "0.5.0-alpha1-buildfix1"
 #endif
 #ifndef AppNumericVersion
   #define AppNumericVersion "0.5.0.0"
@@ -55,9 +55,9 @@ Source: "{#SourceRoot}\data\*"; DestDir: "{app}\data"; Flags: ignoreversion recu
 Source: "{#SourceRoot}\Install-MultichannelBridge.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\Uninstall-MultichannelBridge.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceRoot}\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\INSTALL-BOTH-PCS.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourceRoot}\AV-GOVERNOR.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceRoot}\INSTALL-BOTH-PCS.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#SourceRoot}\RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#SourceRoot}\AV-GOVERNOR.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceRoot}\UPSTREAM-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceRoot}\Multichannel-Bridge-DistroAV-6.2.1.patch"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#SourceRoot}\ROADMAP.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist

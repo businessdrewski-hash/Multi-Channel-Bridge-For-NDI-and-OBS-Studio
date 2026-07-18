@@ -9,7 +9,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $productName = 'Multichannel Bridge for DistroAV'
-$version = '0.5.0-alpha1'
+$version = '0.5.0-alpha1-buildfix1'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $stateRoot = Join-Path $env:ProgramData $productName
 $legacyStateRoot = Join-Path $env:ProgramData 'NDI-Multichannel-Bridge'

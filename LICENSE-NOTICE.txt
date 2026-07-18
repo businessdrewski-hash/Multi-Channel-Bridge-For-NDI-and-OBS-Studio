@@ -1,0 +1,13 @@
+Multichannel Bridge for DistroAV additions
+
+Copyright (C) 2026 Andrew Carriker and contributors
+
+The bridge additions and modified DistroAV build are distributed under the GNU
+General Public License, version 2 or (at your option) any later version, to
+remain compatible with DistroAV. Built packages include DistroAV's license text.
+
+This is an independent, unofficial modified build. It is not affiliated with or
+endorsed by the OBS Project, DistroAV project, or Vizrt NDI AB. NDI® is a
+registered trademark of Vizrt NDI AB.
+
+The software is provided as-is, without warranty of any kind.
