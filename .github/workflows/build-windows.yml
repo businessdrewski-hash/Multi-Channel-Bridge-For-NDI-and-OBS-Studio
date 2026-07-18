@@ -43,28 +43,28 @@ jobs:
         with:
           arch: x64
 
-      - name: Test standalone A/V Governor
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          New-Item -ItemType Directory -Force build-tests | Out-Null
-          cl /nologo /std:c++17 /EHsc /W4 /WX /Ihotfix\bridge `
-            hotfix\bridge\av-governor.cpp tests\av-governor-tests.cpp `
-            /Fe:build-tests\av-governor-tests.exe
-          if ($LASTEXITCODE -ne 0) { throw "A/V Governor test compilation failed with exit code $LASTEXITCODE" }
-          & .\build-tests\av-governor-tests.exe
-          if ($LASTEXITCODE -ne 0) { throw "A/V Governor tests failed with exit code $LASTEXITCODE" }
-
       - name: Test allocation-free Sender Sync Core
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build-tests | Out-Null
           cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /Ihotfix\bridge `
             hotfix\bridge\sender-sync-core.cpp tests\sender-sync-core-tests.cpp `
             /Fe:build-tests\sender-sync-core-tests.exe
           if ($LASTEXITCODE -ne 0) { throw "Sender Sync Core test compilation failed with exit code $LASTEXITCODE" }
           & .\build-tests\sender-sync-core-tests.exe
           if ($LASTEXITCODE -ne 0) { throw "Sender Sync Core tests failed with exit code $LASTEXITCODE" }
+
+      - name: Test downstream linked-audio correction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /Ihotfix\bridge `
+            hotfix\bridge\downstream-sync-core.cpp tests\downstream-sync-core-tests.cpp `
+            /Fe:build-tests\downstream-sync-core-tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "Downstream Sync Core test compilation failed with exit code $LASTEXITCODE" }
+          & .\build-tests\downstream-sync-core-tests.exe
+          if ($LASTEXITCODE -ne 0) { throw "Downstream Sync Core tests failed with exit code $LASTEXITCODE" }
 
       - name: Audit settings and callback safety
         shell: pwsh
@@ -106,10 +106,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Push-Location distroav
-          git add -N src/av-governor.cpp src/av-governor.h src/sender-sync-core.cpp src/sender-sync-core.h `
+          git add -N src/sender-sync-core.cpp src/sender-sync-core.h `
+            src/downstream-sync-core.cpp src/downstream-sync-core.h `
             src/multichannel-bridge.cpp src/multichannel-bridge.h MULTICHANNEL-BRIDGE.md
           git diff --binary -- CMakeLists.txt src/plugin-main.cpp src/main-output.cpp src/ndi-output.cpp src/ndi-source.cpp `
-            src/av-governor.cpp src/av-governor.h src/sender-sync-core.cpp src/sender-sync-core.h `
+            src/sender-sync-core.cpp src/sender-sync-core.h `
+            src/downstream-sync-core.cpp src/downstream-sync-core.h `
             src/multichannel-bridge.cpp src/multichannel-bridge.h MULTICHANNEL-BRIDGE.md `
             | Set-Content -Encoding utf8 "$env:GITHUB_WORKSPACE\Multichannel-Bridge-DistroAV-6.2.1.patch"
           Pop-Location
