@@ -26,8 +26,12 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <thread>
+#include <unordered_map>
 
 #define PROP_SOURCE "ndi_source_name"
 #define PROP_BEHAVIOR "ndi_behavior"
@@ -72,7 +76,7 @@
 
 #define CLOCKLAB_VIDEO_PROBE_ID "distroav_receiver_clock_video_probe"
 #define CLOCKLAB_AUDIO_PROBE_ID "distroav_receiver_clock_audio_probe"
-#define CLOCKLAB_DIAGNOSTICS_POINTER "clocklab_diagnostics_pointer"
+#define CLOCKLAB_DIAGNOSTICS_TOKEN "clocklab_diagnostics_token"
 
 #define PROP_YUV_RANGE_PARTIAL 1
 #define PROP_YUV_RANGE_FULL 2
@@ -143,20 +147,49 @@ typedef struct ndi_source_t {
 	uint64_t last_frame_timestamp;
 
 	distroav::clocklab::Diagnostics *clock_diagnostics;
+	std::shared_ptr<distroav::clocklab::Diagnostics> *clock_diagnostics_owner;
+	uint64_t clock_diagnostics_token;
 	obs_source_t *clock_video_probe;
 	obs_source_t *clock_audio_probe;
 } ndi_source_t;
 
 typedef struct clocklab_probe_t {
-	distroav::clocklab::Diagnostics *diagnostics;
+	std::shared_ptr<distroav::clocklab::Diagnostics> diagnostics;
 } clocklab_probe_t;
 
-static obs_source_t *install_clocklab_probe(obs_source_t *parent, const char *id, const char *name,
-					    distroav::clocklab::Diagnostics *diagnostics)
+namespace {
+std::mutex clocklab_registry_mutex;
+std::unordered_map<uint64_t, std::shared_ptr<distroav::clocklab::Diagnostics>> clocklab_registry;
+std::atomic<uint64_t> clocklab_next_token{1};
+
+uint64_t register_clocklab_diagnostics(const std::shared_ptr<distroav::clocklab::Diagnostics> &diagnostics)
+{
+	const uint64_t token = clocklab_next_token.fetch_add(1, std::memory_order_relaxed);
+	std::lock_guard<std::mutex> lock(clocklab_registry_mutex);
+	clocklab_registry[token] = diagnostics;
+	return token;
+}
+
+std::shared_ptr<distroav::clocklab::Diagnostics> acquire_clocklab_diagnostics(uint64_t token)
+{
+	std::lock_guard<std::mutex> lock(clocklab_registry_mutex);
+	auto it = clocklab_registry.find(token);
+	return it != clocklab_registry.end() ? it->second : nullptr;
+}
+
+void unregister_clocklab_diagnostics(uint64_t token)
+{
+	if (!token)
+		return;
+	std::lock_guard<std::mutex> lock(clocklab_registry_mutex);
+	clocklab_registry.erase(token);
+}
+} // namespace
+
+static obs_source_t *install_clocklab_probe(obs_source_t *parent, const char *id, const char *name, uint64_t token)
 {
 	obs_data_t *settings = obs_data_create();
-	obs_data_set_int(settings, CLOCKLAB_DIAGNOSTICS_POINTER,
-			 static_cast<long long>(reinterpret_cast<intptr_t>(diagnostics)));
+	obs_data_set_int(settings, CLOCKLAB_DIAGNOSTICS_TOKEN, static_cast<long long>(token));
 	obs_source_t *filter = obs_source_create_private(id, name, settings);
 	obs_data_release(settings);
 	if (filter)
@@ -209,8 +242,11 @@ static const char *clocklab_audio_probe_name(void *)
 static void *clocklab_probe_create(obs_data_t *settings, obs_source_t *)
 {
 	auto *probe = new clocklab_probe_t();
-	probe->diagnostics = reinterpret_cast<distroav::clocklab::Diagnostics *>(
-		static_cast<intptr_t>(obs_data_get_int(settings, CLOCKLAB_DIAGNOSTICS_POINTER)));
+	const uint64_t token = static_cast<uint64_t>(obs_data_get_int(settings, CLOCKLAB_DIAGNOSTICS_TOKEN));
+	probe->diagnostics = acquire_clocklab_diagnostics(token);
+	if (!probe->diagnostics)
+		obs_log(LOG_WARNING, "[receiver-clock-lab] Probe created without live diagnostics token=%llu",
+			static_cast<unsigned long long>(token));
 	return probe;
 }
 
@@ -1554,7 +1590,10 @@ void *ndi_source_create(obs_data_t *settings, obs_source_t *obs_source)
 
 	auto s = (ndi_source_t *)bzalloc(sizeof(ndi_source_t));
 	s->obs_source = obs_source;
-	s->clock_diagnostics = new distroav::clocklab::Diagnostics();
+	s->clock_diagnostics_owner =
+		new std::shared_ptr<distroav::clocklab::Diagnostics>(std::make_shared<distroav::clocklab::Diagnostics>());
+	s->clock_diagnostics = s->clock_diagnostics_owner->get();
+	s->clock_diagnostics_token = register_clocklab_diagnostics(*s->clock_diagnostics_owner);
 	char *clocklab_directory = obs_module_config_path("");
 	if (clocklab_directory) {
 		os_mkdirs(clocklab_directory);
@@ -1576,9 +1615,11 @@ void *ndi_source_create(obs_data_t *settings, obs_source_t *obs_source)
 
 	ndi_source_update(s, settings);
 	s->clock_video_probe = install_clocklab_probe(obs_source, CLOCKLAB_VIDEO_PROBE_ID,
-						      "DistroAV Receiver Clock Video Probe", s->clock_diagnostics);
+						      "DistroAV Receiver Clock Video Probe",
+						      s->clock_diagnostics_token);
 	s->clock_audio_probe = install_clocklab_probe(obs_source, CLOCKLAB_AUDIO_PROBE_ID,
-						      "DistroAV Receiver Clock Audio Probe", s->clock_diagnostics);
+						      "DistroAV Receiver Clock Audio Probe",
+						      s->clock_diagnostics_token);
 
 	obs_log(LOG_DEBUG, "'%s' -ndi_source_create(…)", obs_source_name);
 
@@ -1599,8 +1640,11 @@ void ndi_source_destroy(void *data)
 	remove_clocklab_probe(s->obs_source, s->clock_audio_probe);
 	s->clock_video_probe = nullptr;
 	s->clock_audio_probe = nullptr;
-	delete s->clock_diagnostics;
+	unregister_clocklab_diagnostics(s->clock_diagnostics_token);
+	s->clock_diagnostics_token = 0;
 	s->clock_diagnostics = nullptr;
+	delete s->clock_diagnostics_owner;
+	s->clock_diagnostics_owner = nullptr;
 
 	if (s->config.ndi_receiver_name) {
 		bfree(s->config.ndi_receiver_name);
