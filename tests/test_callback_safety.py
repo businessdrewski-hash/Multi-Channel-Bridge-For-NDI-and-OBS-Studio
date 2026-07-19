@@ -48,23 +48,39 @@ if "scratch.resize(" in BRIDGE:
     raise SystemExit("Receiver audio callback can allocate fade scratch storage")
 
 linked = re.search(
-    r"obs_audio_data \*linked_audio_clock_filter\(.*?\n\}(?=\n\nobs_source_t \*install_private_filter)",
+    r"obs_audio_data \*linked_audio_clock_filter\(.*?\n\}",
     BRIDGE,
     flags=re.DOTALL,
 )
 if not linked:
-    raise SystemExit("Could not isolate linked receiver audio filter")
+    raise SystemExit("Could not isolate legacy receiver audio filter")
 linked_callback = linked.group(0)
-linked_violations = [token for token in forbidden_callback_tokens if token in linked_callback]
-if linked_violations:
-    raise SystemExit("Linked receiver callback contains forbidden operations: " + ", ".join(linked_violations))
+if "return audio;" not in linked_callback or "audio->frames" in linked_callback:
+    raise SystemExit("Legacy receiver filter is not a strict pass-through")
+
+route = re.search(
+    r"\tbool route\(.*?\n\t\}(?=\n\n\tbool route_video)",
+    BRIDGE,
+    flags=re.DOTALL,
+)
+if not route:
+    raise SystemExit("Could not isolate shared receiver audio correction path")
+route_callback = route.group(0)
+route_forbidden = tuple(token for token in forbidden_callback_tokens
+                        if token not in ("std::unique_lock", "std::mutex"))
+route_violations = [token for token in route_forbidden if token in route_callback]
+if route_violations:
+    raise SystemExit("Shared receiver correction contains forbidden operations: " + ", ".join(route_violations))
+if "std::try_to_lock" not in route_callback:
+    raise SystemExit("Receiver routing lock can block the real-time callback")
 for marker in (
-    "std::array<std::array<float, kMaxOutputFrames>, MAX_AV_PLANES>",
-    "linked_audio_correction_ppm(filter->pair)",
-    "filter->frame_remainder",
-    "reset_linked_audio_timeline(filter, audio, true)",
+    "std::array<std::array<float, mcb::LinkedAudioPacketClock::kMaxOutputFrames>",
+    "audio_packet_clock_.plan(audio->frames, audio->timestamp",
+    "packet_plan.net_frame_adjustment",
+    "obs_source_output_audio(outputs[static_cast<size_t>(pair)], &output)",
+    "no filter changes a block",
 ):
     if marker not in BRIDGE:
-        raise SystemExit(f"Linked receiver callback safety marker is missing: {marker}")
+        raise SystemExit(f"Shared receiver correction safety marker is missing: {marker}")
 
 print("Callback safety audit passed")

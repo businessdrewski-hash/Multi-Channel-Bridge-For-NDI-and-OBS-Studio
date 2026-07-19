@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Apply Multichannel Bridge for DistroAV v0.6.0-alpha4 to DistroAV 6.2.1.
+"""Apply Multichannel Bridge for DistroAV v0.6.0-alpha5 to DistroAV 6.2.1.
 
 The resulting custom DistroAV package is installed on BOTH computers. The OBS
 Dock selects Gaming PC / Sender or Stream PC / Receiver.
@@ -26,7 +26,7 @@ import re
 import shutil
 from pathlib import Path
 
-PATCH_MARKER = "Multichannel Bridge for DistroAV v0.6.0-alpha4"
+PATCH_MARKER = "Multichannel Bridge for DistroAV v0.6.0-alpha5"
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -244,7 +244,7 @@ def patch_ndi_output(path: Path) -> None:
     )
 
     state_types = r'''
-// Multichannel Bridge for DistroAV v0.6.0-alpha4. SenderSyncCore owns all
+// Multichannel Bridge for DistroAV v0.6.0-alpha5. SenderSyncCore owns all
 // sample storage up front. The atomic flag is a non-blocking safety guard: OBS
 // normally serializes selected-mixer callbacks, but an unexpected concurrent
 // callback is dropped instead of waiting on the real-time audio thread.
@@ -514,7 +514,7 @@ def copy_bridge_files(root: Path, bridge_dir: Path) -> None:
 
 def write_notice(root: Path) -> None:
     (root / "MULTICHANNEL-BRIDGE.md").write_text(
-        "# Multichannel Bridge for DistroAV v0.6.0-alpha4\n\n"
+        "# Multichannel Bridge for DistroAV v0.6.0-alpha5\n\n"
         "Custom DistroAV 6.2.1 build. Install the same package on both PCs, then use "
         "Docks > Multichannel Bridge for DistroAV to select Gaming PC / Sender or Stream PC / Receiver.\n\n"
         "Sender defaults: OBS Track 5 -> NDI channels 1-2; OBS Track 6 -> channels 3-4.\n"
@@ -522,8 +522,10 @@ def write_notice(root: Path) -> None:
         "pairs as independent OBS audio-only sources.\n\n"
         "Sender Sync Core 2.0 uses fixed preallocated audio storage, canonical mix-interval timestamps, "
         "automatic discontinuity re-anchoring, and no blocking callback lock. Downstream Sync Core 2.0 "
-        "measures the OBS-facing video/audio relationship, leaves video untouched, and applies one linked "
-        "audio-rate correction to both stereo outputs. It is optional and enabled by default.\n\n"
+        "measures downstream video against raw receiver audio, leaves video untouched, and commands one "
+        "source-level four-channel audio-rate correction before the split outputs enter OBS. Every complete "
+        "NDI receiver restart wipes learned drift and begins a fresh expected-sync baseline. It is optional "
+        "and enabled by default.\n\n"
         "Experimental. Not affiliated with or endorsed by DistroAV. DistroAV remains GPL-2.0-or-later.\n",
         encoding="utf-8",
         newline="\n",

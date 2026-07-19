@@ -1,6 +1,6 @@
 # Roadmap
 
-## Implemented through 0.6.0-alpha4
+## Implemented through 0.6.0-alpha5
 
 - Stable trusted-reference learning, sample quarantine, and median jitter filtering
 - High-confidence drift-rate estimation after at least 30 seconds of persistent evidence
@@ -19,6 +19,8 @@
 - Normal OBS icon inheritance for floating bridge windows
 - Explicit receiver timing epochs after settings changes and manual **RESTART NDI**
 - Compact raw drift, applied PPM, and corrected-offset status
+- Shared source-level four-channel PPM resampling with inert legacy-filter cleanup
+- Hard rebaseline on every complete NDI receiver restart for the personal setup
 
 ## Next validation work
 

@@ -1,7 +1,7 @@
 # Multichannel Bridge for DistroAV
 
 > Experimental modified DistroAV build for two-PC OBS setups
-> Current version: **0.6.0-alpha4**
+> Current version: **0.6.0-alpha5**
 > Based on: **DistroAV 6.2.1**
 
 ## Personal project and support disclaimer
@@ -59,15 +59,15 @@ The optional receiver-side guard measures the timelines OBS actually receives af
 
 It:
 
-- observes video through a private asynchronous OBS filter and raw split audio at the input of private audio filters;
+- observes video through a private asynchronous OBS filter and raw audio at the shared four-channel receiver handoff;
 - projects both observations to one local instant and median-filters short callback jitter;
 - learns an initial trusted A/V reference only after at least five stable seconds;
 - retains that first trusted reference, so the fifth or eighth measurement window still reports cumulative movement from the original lock;
 - estimates native audio clock error only after at least 30 seconds of sustained evidence;
-- leaves every video timestamp untouched and applies one slew-limited PPM correction to both stereo audio outputs;
-- uses fixed, preallocated interpolation storage and performs no allocation, UI work, logging, or mutex wait in the audio-filter callback;
+- leaves every video timestamp untouched and applies one slew-limited PPM correction to the four-channel packet before either stereo proxy enters OBS;
+- uses fixed, preallocated interpolation storage and performs no allocation, UI work, logging, or mutex wait in the receiver audio callback;
 - preserves the accumulated linked-audio timeline through input timestamp re-anchors, then verifies it against the trusted reference;
-- makes one in-place receiver reconnect attempt even when the dock is hidden if verification fails;
+- makes one in-place receiver restart attempt even when the dock is hidden if verification fails, wiping the old timing epoch;
 - provides a compact **RESTART NDI** action that intentionally starts a fresh receiver timing epoch;
 - restarts the receiver and relearns the baseline after receiver-side bridge settings are applied;
 - summarizes raw audio movement, applied PPM, and the remaining corrected offset in the main monitor;
@@ -122,9 +122,10 @@ flowchart LR
 - One-click sender re-anchor and full NDI Main Output restart
 - No callback-time bridge allocation, queue growth, UI work, or added packing lock
 - Stable five-second trusted-reference learning and projected A/V comparison
-- Downstream OBS-facing video/audio observation after the receiver handoff
+- Downstream OBS-facing video observation plus raw audio measurement at the shared receiver handoff
 - Video-master timing; received video timestamps remain untouched
 - Confidence-gated linked audio-rate correction after at least 30 seconds of one-direction evidence
+- One shared source-level four-channel resampler; no active audio filter mutates blocks inside the OBS mixer path
 - Two-second fault-sample quarantine and recovery verification against the trusted reference
 - Fail-safe bypass if recovery differs materially from the trusted reference or repeatedly fails
 - Continuous corrected audio timeline across receiver input re-anchors
@@ -133,6 +134,7 @@ flowchart LR
 - Duplicate combined-audio suppression
 - One canonical receiver source with an add-existing-reference action for other scenes
 - In-place receiver reconnect after upgrades without deleting the OBS source
+- Every complete NDI receiver restart wipes learned drift and establishes a new expected-sync baseline
 - Split proxy sources explicitly marked audio-active; Create / repair fixes mute, zero volume, and empty mixer routing
 - Compact color-coded monitoring, plain-language rushing/dragging direction, and brief suggested actions
 - Exact sender, receiver, and governor numbers available in a separate collapsible panel
@@ -166,7 +168,7 @@ Compatibility outside that environment is not guaranteed.
 
 Install the same release on both computers.
 
-1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha4.exe`.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha5.exe`.
 2. Close OBS completely.
 3. Run the installer as Administrator on both PCs.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
@@ -290,6 +292,12 @@ More detail: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
 ---
 
 ## Consolidated changelog
+
+### 0.6.0-alpha5
+
+- Moved linked PPM correction from two OBS audio filters to one shared four-channel source handoff to eliminate the confirmed nonzero-PPM mixer jumps.
+- Made every full NDI restart wipe baseline, trend, PPM, accumulated frames, and corrected timestamps before learning the restarted feed as synced.
+- Removed serialized legacy correction filters while retaining an inert compatibility type for safe OBS scene loading.
 
 ### 0.6.0-alpha4
 

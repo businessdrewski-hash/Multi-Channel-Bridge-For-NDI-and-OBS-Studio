@@ -7,7 +7,7 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
-if version != "0.6.0-alpha4":
+if version != "0.6.0-alpha5":
     raise SystemExit(f"Unexpected VERSION: {version}")
 
 checks = {

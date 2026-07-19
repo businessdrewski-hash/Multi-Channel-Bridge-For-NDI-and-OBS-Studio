@@ -30,6 +30,43 @@ int main()
 	constexpr uint32_t sample_rate = 48000;
 	constexpr double native_error_ppm = 22.222222; // 200 ms late after 2.5 hours
 
+	// The alpha 5 actuator owns one fractional clock for the complete
+	// four-channel packet. Validate its long-run frame total and hard reset.
+	mcb::LinkedAudioPacketClock packet_clock;
+	constexpr uint32_t packet_frames = 1024;
+	constexpr size_t packet_count = 3000;
+	uint64_t packet_timestamp = start_ns;
+	uint64_t timestamp_remainder = 0;
+	uint64_t previous_output_timestamp = 0;
+	mcb::LinkedAudioPacketPlan packet_plan{};
+	for (size_t i = 0; i < packet_count; ++i) {
+		packet_plan = packet_clock.plan(packet_frames, packet_timestamp,
+			sample_rate, -30.0, true);
+		require(packet_plan.output_frames == packet_frames ||
+			packet_plan.output_frames + 1 == packet_frames,
+			"negative PPM produced an invalid packet-size change");
+		require(!previous_output_timestamp ||
+			packet_plan.output_timestamp_ns > previous_output_timestamp,
+			"corrected source packet timestamps did not remain monotonic");
+		previous_output_timestamp = packet_plan.output_timestamp_ns;
+		const uint64_t numerator = static_cast<uint64_t>(packet_frames) *
+			mcb::DownstreamSyncCore::kNsPerSecond + timestamp_remainder;
+		packet_timestamp += numerator / sample_rate;
+		timestamp_remainder = numerator % sample_rate;
+	}
+	const long double expected_adjustment = -30.0e-6L *
+		static_cast<long double>(packet_frames) * static_cast<long double>(packet_count);
+	require(std::fabs(static_cast<long double>(packet_plan.net_frame_adjustment) -
+		expected_adjustment) <= 1.0L,
+		"shared packet clock did not accumulate the requested PPM rate");
+	packet_clock.reset(9000000000ULL, sample_rate);
+	packet_plan = packet_clock.plan(packet_frames, 9000000000ULL,
+		sample_rate, 0.0, true);
+	require(packet_plan.output_frames == packet_frames &&
+		packet_plan.output_timestamp_ns == 9000000000ULL &&
+		packet_plan.net_frame_adjustment == 0,
+		"hard NDI epoch reset retained packet-clock correction state");
+
 	mcb::DownstreamSyncCore core;
 	core.configure(true, 1000, 100, 4, 5000, 120000, 30000);
 
@@ -97,6 +134,12 @@ int main()
 	snapshot = core.snapshot();
 	require(!snapshot.baseline_valid && snapshot.phase == mcb::DownstreamSyncPhase::Learning,
 		"manual receiver restart did not discard the old trusted reference");
+	require(snapshot.drift_samples == 0 && snapshot.raw_deviation_ns == 0 &&
+		snapshot.corrected_deviation_ns == 0,
+		"manual receiver restart retained learned drift data");
+	require(snapshot.correction_ppm == 0.0 && snapshot.target_ppm == 0.0 &&
+		snapshot.net_frame_adjustment == 0,
+		"manual receiver restart retained an old PPM command or frame adjustment");
 
 	std::cout << "Downstream Sync Core tests passed\n";
 	return 0;

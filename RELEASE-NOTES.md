@@ -1,13 +1,23 @@
-# v0.6.0-alpha4 release notes
+# v0.6.0-alpha5 release notes
+
+## Alpha 5 source-level correction and hard reset
+
+- Moves linked PPM resampling out of the two OBS audio filters and applies it once to the shared four-channel packet before either MCB proxy source enters OBS.
+- Gives desktop/game and microphone the same corrected frame count, packet timestamp, fractional remainder, and accumulated adjustment by construction.
+- Leaves the old filter type registered only as an inert compatibility shim, then removes every serialized legacy filter after OBS source loading.
+- Prevents a filter from changing `audio->frames` or rebasing timestamps after the standard OBS mixer and meters begin processing a block, addressing the confirmed nonzero-PPM meter jumps.
+- Makes every full NDI receiver restart a hard timing epoch reset for this personal build: baseline, trend history, correction command, fractional remainder, accumulated frames, and corrected packet timestamps are wiped.
+- Learns the restarted receiver as the new expected-sync reference instead of carrying an old correction into the new baseline and falsely reporting approximately `-97 ms` of rushing audio.
+- Retains Downstream Sync Core 2.0 as the measurement/controller layer; the shared source-level resampler is now its actuator.
 
 ## Alpha 4 receiver epoch controls
 
 - Adds a compact **RESTART NDI** button beside the suggested action in the always-visible stream-PC monitor.
 - A manual restart rebuilds the existing canonical DistroAV receiver in place, intentionally discards the old trusted reference, and learns a fresh baseline after the brief A/V cut.
 - Applying any receiver-side bridge setting now performs exactly one receiver restart after all settings are committed and starts a clean timing epoch.
-- Clears stale pre-restart video, audio, and corrected-output observations so they cannot leak into the new learning window.
+- Clears stale pre-restart Sync Core observations; alpha 5 additionally clears the actuator's accumulated correction and timestamps.
 - Adds an always-visible summary of raw audio movement, applied PPM, and remaining corrected movement.
-- Automatic fail-safe recovery still preserves the trusted reference and verifies the reconnect against it; only explicit user/configuration resets intentionally rebaseline.
+- Alpha 4 automatic recovery preserved its trusted reference. Alpha 5 supersedes this for the personal build: every complete NDI restart now rebaselines.
 
 ## Alpha 3 filter lifecycle correction
 
@@ -25,11 +35,11 @@
 ## Long-recording drift correction
 
 - Replaces receiver video timestamp pacing with Downstream Sync Core 2.0.
-- Observes the canonical video and split-audio timelines after they enter OBS, which exposes drift that was invisible at the earlier receiver hook.
+- Observes canonical video downstream in OBS and raw audio at the shared receiver handoff, then explicitly accounts for the correction applied to the two proxy outputs.
 - Keeps video as the master clock and leaves its timestamps unchanged.
 - Measures native audio drift before correction and retains the first trusted reference across every later trend window.
 - Applies one shared, slew-limited PPM command to desktop/game and microphone, preserving their relative timing.
-- Uses fixed preallocated interpolation buffers; the receiver audio callback does not allocate, log, touch UI, or wait on a mutex.
+- Uses one set of fixed preallocated four-channel interpolation buffers; the receiver audio callback does not allocate, log, touch UI, or wait on a mutex.
 - Preserves accumulated corrected timing across raw input timestamp re-anchors and verifies the recovered output against the trusted reference.
 - Adds a deterministic 2.5-hour simulation of 22.22 ppm audio error: 200 ms raw late drift is detected while corrected output remains near the trusted sync.
 
@@ -47,13 +57,13 @@
 
 ## Trusted recovery and drift safety
 
-- Keeps the last trusted A/V reference across discontinuities and automatic fail-safe reconnects.
+- Keeps the last trusted A/V reference across in-place timestamp incidents that do not rebuild NDI.
 - Requires five stable seconds before accepting the initial reference or a recovery candidate.
 - Quarantines two seconds of observations after a fault so a jump cannot contaminate baseline or drift calculations.
 - Rejects a recovered offset that differs materially from the trusted reference instead of silently declaring it normal.
 - Requires at least 30 seconds of persistent drift evidence before changing the linked audio rate.
 - Reports when correction reaches its safe limit.
-- Performs one automatic in-place receiver reconnect even when the dock is hidden, then fails open and stops automatic interference if safe recovery cannot be verified or recovery repeats too often.
+- Performs at most one automatic in-place receiver restart even when the dock is hidden; that complete restart intentionally begins a fresh baseline in this personal build.
 
 ## Compact monitoring and receiver QOL
 
@@ -139,8 +149,8 @@ OBS Track B -> NDI channels 3-4 -> Microphone
 The GitHub Action builds:
 
 ```text
-Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha4.exe
-Multichannel-Bridge-for-DistroAV-v0.6.0-alpha4-Portable-Windows-x64.zip
+Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha5.exe
+Multichannel-Bridge-for-DistroAV-v0.6.0-alpha5-Portable-Windows-x64.zip
 Multichannel-Bridge-DistroAV-6.2.1.patch
 SHA256SUMS.txt
 ```

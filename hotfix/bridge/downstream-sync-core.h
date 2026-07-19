@@ -46,10 +46,42 @@ struct DownstreamSyncSnapshot {
 	uint64_t last_audio_wall_ns = 0;
 };
 
+struct LinkedAudioPacketPlan {
+	uint32_t output_frames = 0;
+	uint64_t output_timestamp_ns = 0;
+	int64_t net_frame_adjustment = 0;
+};
+
+// Allocation-free actuator clock for the shared four-channel source packet.
+// One instance owns the fractional frame remainder and corrected timestamp so
+// both stereo proxies are guaranteed to receive the same packet duration.
+class LinkedAudioPacketClock {
+public:
+	static constexpr uint32_t kMaxInputFrames = 4096;
+	static constexpr uint32_t kMaxOutputFrames = 4128;
+
+	void reset(uint64_t input_timestamp_ns, uint32_t sample_rate) noexcept;
+	LinkedAudioPacketPlan plan(uint32_t input_frames, uint64_t input_timestamp_ns,
+		uint32_t sample_rate, double correction_ppm, bool enabled) noexcept;
+
+private:
+	static uint64_t frames_to_ns(uint32_t frames, uint32_t sample_rate,
+		uint64_t &remainder) noexcept;
+	uint32_t sample_rate_ = 48000;
+	uint64_t expected_input_timestamp_ns_ = 0;
+	uint64_t next_output_timestamp_ns_ = 0;
+	uint64_t input_timestamp_remainder_ = 0;
+	uint64_t output_timestamp_remainder_ = 0;
+	double frame_remainder_ = 0.0;
+	int64_t net_frame_adjustment_ = 0;
+	bool initialized_ = false;
+};
+
 // Receiver-side controller modeled after Sync Guardian's proven observation
-// point. Video is observed by an OBS async-video filter and audio is observed
-// at the input of the private linked resampling filters. The callbacks only
-// publish atomics; filtering and UI snapshots never wait on those callbacks.
+// point. Video is observed by an OBS async-video filter; raw audio is observed
+// at the shared four-channel receiver handoff before one linked correction is
+// submitted to the two proxy sources. Callbacks only publish atomics; trend
+// analysis and UI snapshots never wait on those callbacks.
 class DownstreamSyncCore {
 public:
 	static constexpr uint64_t kNsPerSecond = 1000000000ULL;
@@ -71,10 +103,6 @@ public:
 	double correction_ppm() const noexcept
 	{
 		return correction_ppm_.load(std::memory_order_relaxed);
-	}
-	uint64_t filter_generation() const noexcept
-	{
-		return filter_generation_.load(std::memory_order_acquire);
 	}
 	bool enabled() const noexcept { return enabled_.load(std::memory_order_relaxed); }
 
@@ -114,8 +142,6 @@ private:
 	std::atomic<uint64_t> drift_minimum_ns_{30000000000ULL};
 	std::atomic<double> correction_ppm_{0.0};
 	std::atomic<double> target_ppm_{0.0};
-	std::atomic<uint64_t> filter_generation_{1};
-
 	std::atomic<uint64_t> video_timestamp_ns_{0};
 	std::atomic<uint64_t> video_wall_ns_{0};
 	std::atomic<uint64_t> audio_timestamp_ns_{0};

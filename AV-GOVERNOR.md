@@ -9,8 +9,8 @@ The earlier implementation observed audio and video before their OBS source path
 Sync Core 2.0 observes:
 
 1. the canonical DistroAV video timestamp through a private asynchronous-video filter;
-2. the split audio timestamp at the input of a private audio filter, after the receiver handoff;
-3. the linked correction actually applied to both split outputs.
+2. the raw four-channel audio timestamp at the receiver handoff, before OBS receives either split proxy;
+3. the linked frame/timestamp correction actually submitted to both split outputs.
 
 The observations are projected to one monotonic wall-clock instant and median-filtered. A five-second stable window establishes the trusted reference. Later 30-to-120-second trend windows estimate native audio clock error, but they do not replace that reference. This means a fifth or eighth analysis window still reports cumulative movement from the first trusted lock.
 
@@ -18,9 +18,9 @@ The observations are projected to one monotonic wall-clock instant and median-fi
 
 Video is the master clock and every received video timestamp passes through unchanged.
 
-When downstream evidence reaches at least 75% confidence, the core applies one shared PPM command to both stereo audio filters. Positive video-minus-audio movement means audio is falling behind; the filters emit slightly fewer frames to move both audio buses forward together. A small catch-up component removes an existing offset, then the steady command converges on the measured native clock error.
+When downstream evidence reaches at least 75% confidence, the core applies one shared PPM command to the four-channel packet before either proxy enters OBS. Positive video-minus-audio movement means audio is falling behind; the source handoff emits slightly fewer frames to move both audio buses forward together. A small catch-up component removes an existing offset, then the steady command converges on the measured native clock error.
 
-Both filters use the same command and identical fractional-frame accounting, so desktop/game and microphone cannot drift relative to each other.
+Desktop/game and microphone share the same output frame count, timestamp, and fractional-frame accumulator, so they cannot drift relative to each other. The legacy OBS audio-filter type is inert and removed after source loading.
 
 ## Recommended defaults
 
@@ -50,18 +50,18 @@ The 1000 ppm ceiling is primarily available to remove an existing offset. A stea
 
 ## Recovery
 
-Backward timestamps, repeated clock movement, or a greater-than-50 ms timestamp-versus-wall discontinuity start a two-second quarantine. During automatic recovery, the first baseline is retained. The linked output timeline and its cumulative frame adjustment are preserved while the raw input clock is re-anchored, preventing an automatic reconnect from silently accepting an hours-late raw clock.
+Backward timestamps, repeated clock movement, or a greater-than-50 ms timestamp-versus-wall discontinuity start a two-second quarantine. If NDI itself remains alive, the first baseline and corrected output timeline are retained while the raw input clock is evaluated.
 
-An explicit **RESTART NDI** or applied receiver-setting change is different: it deliberately discards the old baseline, clears the last video/audio/output observations, rebuilds the existing receiver, and learns a new trusted reference after the brief cut.
+Any complete NDI receiver restart, whether manual, configuration-driven, or the single automatic recovery attempt, deliberately discards the old baseline, trend samples, PPM command, fractional remainder, accumulated correction, and last clock observations. The restarted feed is treated as the expected-sync condition and learns a new trusted reference after the brief cut.
 
 After quarantine, five stable seconds must agree with the trusted reference within 40 ms. If not, the plugin leaves output live, stops correction, and requests attention rather than accepting the fault as a new normal.
 
 ## Real-time safety
 
-- fixed-size interpolation buffers allocated when each private filter is created;
+- one fixed-size set of four-channel interpolation buffers owned by the receiver router;
 - no allocation, logging, file access, UI work, or mutex wait in the audio callback;
 - bounded linear interpolation only when the fractional command crosses a frame boundary;
-- raw samples are returned unchanged while correction is disabled or a block exceeds the fixed safety capacity;
+- raw source packets are submitted unchanged while correction is disabled or a block exceeds the fixed safety capacity;
 - the controller and trend regression run on a 250 ms Qt timer, even while the dock is hidden.
 
 ## Diagnostics

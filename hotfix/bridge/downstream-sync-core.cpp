@@ -2,10 +2,81 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 
 namespace mcb {
+
+uint64_t LinkedAudioPacketClock::frames_to_ns(uint32_t frames, uint32_t sample_rate,
+	uint64_t &remainder) noexcept
+{
+	if (!sample_rate)
+		return 0;
+	const uint64_t numerator = static_cast<uint64_t>(frames) * DownstreamSyncCore::kNsPerSecond + remainder;
+	const uint64_t duration = numerator / sample_rate;
+	remainder = numerator % sample_rate;
+	return duration;
+}
+
+void LinkedAudioPacketClock::reset(uint64_t input_timestamp_ns, uint32_t sample_rate) noexcept
+{
+	sample_rate_ = sample_rate ? sample_rate : 48000;
+	expected_input_timestamp_ns_ = input_timestamp_ns;
+	next_output_timestamp_ns_ = input_timestamp_ns;
+	input_timestamp_remainder_ = 0;
+	output_timestamp_remainder_ = 0;
+	frame_remainder_ = 0.0;
+	net_frame_adjustment_ = 0;
+	initialized_ = input_timestamp_ns != 0;
+}
+
+LinkedAudioPacketPlan LinkedAudioPacketClock::plan(uint32_t input_frames,
+	uint64_t input_timestamp_ns, uint32_t sample_rate, double correction_ppm,
+	bool enabled) noexcept
+{
+	if (!input_frames)
+		return {};
+	if (!enabled || !sample_rate || input_frames > kMaxInputFrames) {
+		reset(input_timestamp_ns, sample_rate);
+		return {input_frames, input_timestamp_ns, 0};
+	}
+	if (!initialized_ || sample_rate_ != sample_rate)
+		reset(input_timestamp_ns, sample_rate);
+	else if (input_timestamp_ns && expected_input_timestamp_ns_) {
+		const int64_t timestamp_error = input_timestamp_ns >= expected_input_timestamp_ns_
+			? static_cast<int64_t>(input_timestamp_ns - expected_input_timestamp_ns_)
+			: -static_cast<int64_t>(expected_input_timestamp_ns_ - input_timestamp_ns);
+		if (std::llabs(timestamp_error) > 50000000LL) {
+			// Preserve accumulated correction for a raw timestamp re-anchor that
+			// did not rebuild NDI. A full receiver restart calls reset() first.
+			frame_remainder_ = 0.0;
+			input_timestamp_remainder_ = 0;
+			expected_input_timestamp_ns_ = input_timestamp_ns;
+		}
+	}
+
+	const double ppm = std::clamp(correction_ppm, -5000.0, 5000.0);
+	const double desired_frames = static_cast<double>(input_frames) *
+		(1.0 + ppm * 1.0e-6) + frame_remainder_;
+	const uint32_t output_frames = static_cast<uint32_t>(std::max(1.0, std::floor(desired_frames)));
+	if (output_frames > kMaxOutputFrames) {
+		reset(input_timestamp_ns, sample_rate);
+		return {input_frames, input_timestamp_ns, 0};
+	}
+	frame_remainder_ = desired_frames - static_cast<double>(output_frames);
+	const uint64_t output_timestamp = next_output_timestamp_ns_
+		? next_output_timestamp_ns_ : input_timestamp_ns;
+	if (input_timestamp_ns)
+		expected_input_timestamp_ns_ = input_timestamp_ns +
+			frames_to_ns(input_frames, sample_rate_, input_timestamp_remainder_);
+	if (output_timestamp)
+		next_output_timestamp_ns_ = output_timestamp +
+			frames_to_ns(output_frames, sample_rate_, output_timestamp_remainder_);
+	net_frame_adjustment_ += static_cast<int64_t>(output_frames) -
+		static_cast<int64_t>(input_frames);
+	return {output_frames, output_timestamp, net_frame_adjustment_};
+}
 
 uint64_t DownstreamSyncCore::magnitude(int64_t value) noexcept
 {
@@ -115,7 +186,9 @@ void DownstreamSyncCore::reset(bool reset_counters, bool preserve_trusted_baseli
 	audio_wall_ns_.store(0, std::memory_order_relaxed);
 	output_timestamp_ns_.store(0, std::memory_order_relaxed);
 	output_wall_ns_.store(0, std::memory_order_relaxed);
-	filter_generation_.fetch_add(1, std::memory_order_acq_rel);
+	observed_incident_generation_ = incident_generation_.load(std::memory_order_acquire);
+	last_incident_wall_ns_.store(0, std::memory_order_relaxed);
+	quarantine_until_ns_ = 0;
 }
 
 void DownstreamSyncCore::observe_clock(std::atomic<uint64_t> &timestamp,
@@ -176,7 +249,6 @@ void DownstreamSyncCore::handle_incident_locked(uint64_t wall_ns)
 	last_trend_sample_ns_ = 0;
 	correction_ppm_.store(0.0, std::memory_order_relaxed);
 	target_ppm_.store(0.0, std::memory_order_relaxed);
-	filter_generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void DownstreamSyncCore::push_filtered_locked(int64_t raw_relation_ns)

@@ -61,8 +61,7 @@ constexpr const char *kVideoProbeFilterId = "ndi_multichannel_bridge_downstream_
 constexpr const char *kAudioClockFilterId = "ndi_multichannel_bridge_linked_audio_clock";
 constexpr const char *kVideoProbeFilterName = "[MCB] Downstream Video Clock";
 constexpr const char *kAudioClockFilterName = "[MCB] Linked Audio Clock";
-constexpr const char *kAudioClockPairKey = "mcb_audio_clock_pair";
-constexpr const char *kVersion = "0.6.0-alpha4";
+constexpr const char *kVersion = "0.6.0-alpha5";
 constexpr const char *kGovernorVersion = "2.0";
 constexpr const char *kSenderCoreVersion = "2.0";
 constexpr const char *kDefaultProgramName = "MCB Desktop / Game";
@@ -202,73 +201,47 @@ public:
 		if (pair < 0 || pair > 1 || !source)
 			return;
 		const size_t index = static_cast<size_t>(pair);
-		obs_data_t *settings = obs_data_create();
-		obs_data_set_int(settings, kAudioClockPairKey, pair);
-		obs_source_t *filter = install_private_filter(source, kAudioClockFilterId,
-			kAudioClockFilterName, settings);
-		obs_data_release(settings);
+		// Alpha 5 applies one correction to the four-channel packet before either
+		// proxy enters OBS. Remove any serialized alpha 1-4 clock filters; they
+		// must never mutate blocks in the OBS mixer path again.
+		remove_private_filters_by_id(source, kAudioClockFilterId);
 		std::lock_guard<std::mutex> lock(mutex_);
 		proxies_[index] = source;
-		audio_clock_filters_[index] = filter;
 	}
 
 	void unregister_proxy(int pair, obs_source_t *source)
 	{
 		if (pair < 0 || pair > 1)
 			return;
-		obs_source_t *filter = nullptr;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			const size_t index = static_cast<size_t>(pair);
 			auto &slot = proxies_[index];
-			if (slot == source) {
+			if (slot == source)
 				slot = nullptr;
-				filter = audio_clock_filters_[index];
-				audio_clock_filters_[index] = nullptr;
-			}
 		}
-		remove_private_filter(source, filter);
+		remove_private_filters_by_id(source, kAudioClockFilterId);
 	}
 
 	void reconcile_audio_clock_filters()
 	{
 		std::array<obs_source_t *, 2> sources{};
-		std::array<obs_source_t *, 2> tracked{};
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
 			for (size_t pair = 0; pair < sources.size(); ++pair) {
 				if (proxies_[pair])
 					sources[pair] = obs_source_get_ref(proxies_[pair]);
-				tracked[pair] = audio_clock_filters_[pair];
-				audio_clock_filters_[pair] = nullptr;
 			}
 		}
 
 		for (size_t pair = 0; pair < sources.size(); ++pair) {
-			if (!sources[pair]) {
-				if (tracked[pair])
-					obs_source_release(tracked[pair]);
+			if (!sources[pair])
 				continue;
-			}
-			remove_private_filter(sources[pair], tracked[pair]);
-			obs_data_t *settings = obs_data_create();
-			obs_data_set_int(settings, kAudioClockPairKey, static_cast<long long>(pair));
-			obs_source_t *replacement = install_private_filter(sources[pair], kAudioClockFilterId,
-				kAudioClockFilterName, settings);
-			obs_data_release(settings);
-			{
-				std::lock_guard<std::mutex> lock(mutex_);
-				if (proxies_[pair] == sources[pair]) {
-					audio_clock_filters_[pair] = replacement;
-					replacement = nullptr;
-				}
-			}
-			if (replacement)
-				remove_private_filter(sources[pair], replacement);
+			remove_private_filters_by_id(sources[pair], kAudioClockFilterId);
 			obs_source_release(sources[pair]);
 		}
 		obs_log(LOG_INFO,
-			"[multichannel-bridge] Reconciled linked audio clock filters after OBS source loading");
+			"[multichannel-bridge] Removed legacy linked audio clock filters after OBS source loading");
 	}
 
 	bool attach(const std::string &name)
@@ -327,7 +300,7 @@ public:
 		if (old)
 			obs_source_release(old);
 		attached_.store(false, std::memory_order_release);
-		sync_core_.reset(false, false);
+		hard_reset_sync(false);
 	}
 
 	void set_suppress_original(bool suppress)
@@ -342,6 +315,7 @@ public:
 		sync_core_.configure(enabled && drift_correction, max_audio_correction_ppm,
 			correction_slew_ppm, correction_dead_zone_ms, baseline_window_ms,
 			drift_window_ms, drift_minimum_ms);
+		request_audio_epoch_reset();
 	}
 
 	bool apply_recommended_source_settings()
@@ -371,7 +345,7 @@ public:
 		return true;
 	}
 
-	bool force_reconnect(bool preserve_trusted_baseline = false)
+	bool force_reconnect()
 	{
 		obs_source_t *source = nullptr;
 		{
@@ -390,10 +364,12 @@ public:
 		calldata_free(&params);
 		obs_source_release(source);
 		if (accepted) {
-			sync_core_.reset(false, preserve_trusted_baseline);
+			// Personal-build contract: every complete NDI receiver restart is a
+			// known-good sync point. Wipe baseline, drift history, PPM command,
+			// accumulated frames, and corrected packet timestamps together.
+			hard_reset_sync(false);
 			obs_log(LOG_INFO,
-				"[multichannel-bridge] Requested an in-place DistroAV receiver reconnect (%s baseline)",
-				preserve_trusted_baseline ? "verify trusted" : "discard old");
+				"[multichannel-bridge] Requested an in-place DistroAV receiver reconnect and wiped all learned drift state");
 		}
 		return accepted;
 	}
@@ -407,7 +383,7 @@ public:
 				source = obs_source_get_ref(input_);
 		}
 		if (!source) {
-			sync_core_.reset(false, true);
+			hard_reset_sync(false);
 			return false;
 		}
 		obs_data_t *settings = obs_source_get_settings(source);
@@ -417,7 +393,7 @@ public:
 			obs_data_release(settings);
 		obs_source_release(source);
 		if (!configured)
-			sync_core_.reset(false, true);
+			hard_reset_sync(false);
 		return configured;
 	}
 
@@ -426,6 +402,12 @@ public:
 	{
 		if (!origin || !audio || audio->frames == 0)
 			return false;
+		if (audio_route_busy_.test_and_set(std::memory_order_acquire))
+			return false;
+		struct BusyGuard {
+			std::atomic_flag &flag;
+			~BusyGuard() { flag.clear(std::memory_order_release); }
+		} busy_guard{audio_route_busy_};
 
 		std::array<obs_source_t *, 2> outputs{};
 		{
@@ -448,13 +430,45 @@ public:
 
 		(void)ndi_timestamp_100ns;
 		(void)ndi_timecode_100ns;
-		// Keep the receiver handoff untouched. Private filters on both proxy
-		// sources observe the actual OBS-facing audio timeline and apply the same
-		// linked rate command after this point.
+		auto &core = sync_core_;
+		core.observe_audio_input(audio->timestamp, now_ns);
+		const uint64_t requested_epoch = audio_epoch_generation_.load(std::memory_order_acquire);
+		if (observed_audio_epoch_ != requested_epoch || correction_sample_rate_ != audio->samples_per_sec) {
+			observed_audio_epoch_ = requested_epoch;
+			reset_audio_correction_timeline(audio);
+		}
+
+		const bool correction_supported = core.enabled() &&
+			audio->format == AUDIO_FORMAT_FLOAT_PLANAR && audio->samples_per_sec != 0 &&
+			audio->frames <= mcb::LinkedAudioPacketClock::kMaxInputFrames;
+		const auto packet_plan = audio_packet_clock_.plan(audio->frames, audio->timestamp,
+			audio->samples_per_sec, core.correction_ppm(), correction_supported);
+		const uint32_t output_frames = packet_plan.output_frames;
+		const uint64_t output_timestamp = packet_plan.output_timestamp_ns;
+		const bool resampled = correction_supported && output_frames != audio->frames;
+		if (resampled) {
+			for (size_t channel = 0; channel < kCorrectionChannels; ++channel) {
+				if (channel < static_cast<size_t>(std::max(channel_count, 0)) && audio->data[channel])
+					resample_plane(reinterpret_cast<const float *>(audio->data[channel]),
+						audio->frames, correction_planes_[channel].data(), output_frames);
+			}
+		}
+
+		// Both stereo proxies receive one corrected packet duration and timestamp.
+		// OBS sees valid source packets at ingestion; no filter changes a block
+		// after the standard mixer and its meters have begun processing it.
 		for (int pair = 0; pair < 2; ++pair) {
 			const int first = pair * 2;
-			const uint8_t *left = first < channel_count ? audio->data[first] : nullptr;
-			const uint8_t *right = (first + 1) < channel_count ? audio->data[first + 1] : nullptr;
+			const uint8_t *left = first < channel_count && audio->data[first]
+				? resampled
+					? reinterpret_cast<const uint8_t *>(correction_planes_[static_cast<size_t>(first)].data())
+					: audio->data[first]
+				: nullptr;
+			const uint8_t *right = (first + 1) < channel_count && audio->data[first + 1]
+				? resampled
+					? reinterpret_cast<const uint8_t *>(correction_planes_[static_cast<size_t>(first + 1)].data())
+					: audio->data[first + 1]
+				: nullptr;
 			if (!left && !right) {
 				missing_[static_cast<size_t>(pair)].fetch_add(1, std::memory_order_relaxed);
 				peaks_[static_cast<size_t>(pair)].store(0.0f, std::memory_order_relaxed);
@@ -467,22 +481,24 @@ public:
 			if (!right)
 				right = left;
 			const float peak = mcb_ui_monitoring_enabled()
-				? calculate_peak(left, right, audio->frames)
+				? calculate_peak(left, right, output_frames)
 				: 0.0f;
 			peaks_[static_cast<size_t>(pair)].store(peak, std::memory_order_relaxed);
 			if (outputs[static_cast<size_t>(pair)]) {
 				obs_source_audio output{};
 				output.data[0] = const_cast<uint8_t *>(left);
 				output.data[1] = const_cast<uint8_t *>(right);
-				output.frames = audio->frames;
+				output.frames = output_frames;
 				output.samples_per_sec = audio->samples_per_sec;
 				output.speakers = SPEAKERS_STEREO;
 				output.format = audio->format;
-				output.timestamp = audio->timestamp;
+				output.timestamp = output_timestamp;
 				obs_source_output_audio(outputs[static_cast<size_t>(pair)], &output);
 				obs_source_release(outputs[static_cast<size_t>(pair)]);
 			}
 		}
+		core.report_audio_output(output_timestamp, now_ns,
+			packet_plan.net_frame_adjustment, correction_sample_rate_);
 
 		const bool suppress = suppress_original_.load(std::memory_order_acquire) && split_active && channel_count >= 4;
 		if (suppress)
@@ -517,18 +533,9 @@ public:
 	mcb::DownstreamSyncSnapshot sync_snapshot() const { return sync_core_.snapshot(); }
 	std::string governor_flight_recorder_csv() const { return sync_core_.diagnostics_csv(); }
 	mcb::DownstreamSyncCore &sync_core() { return sync_core_; }
-	double linked_audio_correction_ppm(int pair)
-	{
-		if (pair == 0) {
-			const double command = sync_core_.correction_ppm();
-			linked_audio_command_ppm_.store(command, std::memory_order_release);
-			return command;
-		}
-		return linked_audio_command_ppm_.load(std::memory_order_acquire);
-	}
 	void controller_tick(uint64_t now_ns) { sync_core_.tick(now_ns); }
 
-	void reset_governor(bool reset_counters) { sync_core_.reset(reset_counters, false); }
+	void reset_governor(bool reset_counters) { hard_reset_sync(reset_counters); }
 
 	bool attached() const
 	{
@@ -584,6 +591,45 @@ public:
 	}
 
 private:
+	static constexpr size_t kCorrectionChannels = 4;
+
+	void request_audio_epoch_reset()
+	{
+		audio_epoch_generation_.fetch_add(1, std::memory_order_acq_rel);
+	}
+
+	void hard_reset_sync(bool reset_counters)
+	{
+		sync_core_.reset(reset_counters, false);
+		request_audio_epoch_reset();
+	}
+
+	void reset_audio_correction_timeline(const obs_source_audio *audio)
+	{
+		correction_sample_rate_ = audio && audio->samples_per_sec ? audio->samples_per_sec : 48000;
+		audio_packet_clock_.reset(audio ? audio->timestamp : 0, correction_sample_rate_);
+	}
+
+	static void resample_plane(const float *input, uint32_t input_frames,
+		float *output, uint32_t output_frames)
+	{
+		if (!input || !output || !input_frames || !output_frames)
+			return;
+		if (input_frames == 1 || output_frames == 1) {
+			output[0] = input[0];
+			return;
+		}
+		const double scale = static_cast<double>(input_frames - 1) /
+			static_cast<double>(output_frames - 1);
+		for (uint32_t frame = 0; frame < output_frames; ++frame) {
+			const double position = static_cast<double>(frame) * scale;
+			const uint32_t left = static_cast<uint32_t>(position);
+			const uint32_t right = std::min(left + 1, input_frames - 1);
+			const float fraction = static_cast<float>(position - static_cast<double>(left));
+			output[frame] = input[left] + (input[right] - input[left]) * fraction;
+		}
+	}
+
 	static float calculate_peak(const uint8_t *left, const uint8_t *right, uint32_t frames)
 	{
 		if ((!left && !right) || frames == 0)
@@ -606,7 +652,6 @@ private:
 	obs_source_t *input_ = nullptr;
 	obs_source_t *video_probe_filter_ = nullptr;
 	std::array<obs_source_t *, 2> proxies_{};
-	std::array<obs_source_t *, 2> audio_clock_filters_{};
 	std::string input_name_;
 	std::string last_error_;
 	std::atomic_bool attached_{false};
@@ -617,58 +662,18 @@ private:
 	std::atomic_int channels_{0};
 	std::array<std::atomic<float>, 2> peaks_{};
 	std::atomic_uint64_t last_packet_ns_{0};
-	std::atomic<double> linked_audio_command_ppm_{0.0};
+	std::atomic_flag audio_route_busy_ = ATOMIC_FLAG_INIT;
+	std::atomic_uint64_t audio_epoch_generation_{1};
+	uint64_t observed_audio_epoch_ = 0;
+	uint32_t correction_sample_rate_ = 48000;
+	mcb::LinkedAudioPacketClock audio_packet_clock_;
+	std::array<std::array<float, mcb::LinkedAudioPacketClock::kMaxOutputFrames>,
+		kCorrectionChannels> correction_planes_{};
 	mcb::DownstreamSyncCore sync_core_;
 };
 
-struct LinkedAudioClockFilter {
-	static constexpr uint32_t kMaxInputFrames = 4096;
-	static constexpr uint32_t kMaxOutputFrames = 4128; // room for the ±5000 ppm hard clamp
-	int pair = 0;
-	uint32_t sample_rate = 48000;
-	uint64_t observed_generation = 0;
-	uint64_t expected_input_timestamp_ns = 0;
-	uint64_t next_output_timestamp_ns = 0;
-	uint64_t input_timestamp_remainder = 0;
-	uint64_t output_timestamp_remainder = 0;
-	double frame_remainder = 0.0;
-	int64_t net_frame_adjustment = 0;
-	bool timeline_initialized = false;
-	obs_audio_data output{};
-	std::array<std::array<float, kMaxOutputFrames>, MAX_AV_PLANES> planes{};
-};
-
-uint64_t audio_frames_to_ns(uint32_t frames, uint32_t sample_rate, uint64_t &remainder)
-{
-	if (!sample_rate)
-		return 0;
-	const uint64_t numerator = static_cast<uint64_t>(frames) * 1000000000ULL + remainder;
-	const uint64_t duration = numerator / sample_rate;
-	remainder = numerator % sample_rate;
-	return duration;
-}
-
-void reset_linked_audio_timeline(LinkedAudioClockFilter *filter, const obs_audio_data *audio,
-	bool preserve_output_timeline = false)
-{
-	if (!filter)
-		return;
-	filter->frame_remainder = 0.0;
-	filter->input_timestamp_remainder = 0;
-	filter->expected_input_timestamp_ns = audio ? audio->timestamp : 0;
-	if (!preserve_output_timeline || !filter->timeline_initialized) {
-		filter->output_timestamp_remainder = 0;
-		filter->next_output_timestamp_ns = audio ? audio->timestamp : 0;
-		filter->net_frame_adjustment = 0;
-	}
-	filter->timeline_initialized = audio && audio->timestamp;
-	if (filter->pair == 0)
-		ReceiverRouter::instance().sync_core().report_audio_output(
-			audio ? audio->timestamp : 0, os_gettime_ns(), 0, filter->sample_rate);
-}
-
 const char *video_probe_display_name(void *) { return "Multichannel Bridge Downstream Video Probe"; }
-const char *audio_clock_display_name(void *) { return "Multichannel Bridge Linked Audio Clock"; }
+const char *audio_clock_display_name(void *) { return "Multichannel Bridge Legacy Audio Clock (inactive)"; }
 
 void *video_probe_create(obs_data_t *, obs_source_t *) { return reinterpret_cast<void *>(1); }
 void video_probe_destroy(void *) {}
@@ -680,109 +685,15 @@ obs_source_frame *video_probe_filter(void *, obs_source_frame *frame)
 	return frame;
 }
 
-void *linked_audio_clock_create(obs_data_t *settings, obs_source_t *)
+// Keep the old source type registered so OBS can deserialize alpha 1-4 scene
+// collections safely. It is a strict pass-through and is removed from both MCB
+// proxies after source loading; all alpha 5 correction happens before source
+// ingestion in ReceiverRouter::route().
+void *linked_audio_clock_create(obs_data_t *, obs_source_t *) { return reinterpret_cast<void *>(1); }
+void linked_audio_clock_destroy(void *) {}
+obs_audio_data *linked_audio_clock_filter(void *, obs_audio_data *audio)
 {
-	auto *filter = new LinkedAudioClockFilter();
-	filter->pair = settings ? std::clamp(static_cast<int>(obs_data_get_int(settings, kAudioClockPairKey)), 0, 1) : 0;
-	obs_audio_info info{};
-	if (obs_get_audio_info(&info) && info.samples_per_sec)
-		filter->sample_rate = info.samples_per_sec;
-	return filter;
-}
-
-void linked_audio_clock_destroy(void *data)
-{
-	delete static_cast<LinkedAudioClockFilter *>(data);
-}
-
-obs_audio_data *linked_audio_clock_filter(void *data, obs_audio_data *audio)
-{
-	auto *filter = static_cast<LinkedAudioClockFilter *>(data);
-	if (!filter || !audio || !audio->frames)
-		return audio;
-	auto &core = ReceiverRouter::instance().sync_core();
-	const uint64_t wall_ns = os_gettime_ns();
-	if (filter->pair == 0)
-		core.observe_audio_input(audio->timestamp, wall_ns);
-
-	const uint64_t generation = core.filter_generation();
-	if (generation != filter->observed_generation) {
-		filter->observed_generation = generation;
-		reset_linked_audio_timeline(filter, audio, true);
-	}
-	if (!core.enabled()) {
-		reset_linked_audio_timeline(filter, audio, false);
-		return audio;
-	}
-
-	const double ppm = std::clamp(
-		ReceiverRouter::instance().linked_audio_correction_ppm(filter->pair), -5000.0, 5000.0);
-	if (!filter->timeline_initialized)
-		reset_linked_audio_timeline(filter, audio);
-	else if (audio->timestamp && filter->expected_input_timestamp_ns) {
-		const int64_t timestamp_error = audio->timestamp >= filter->expected_input_timestamp_ns
-			? static_cast<int64_t>(audio->timestamp - filter->expected_input_timestamp_ns)
-			: -static_cast<int64_t>(filter->expected_input_timestamp_ns - audio->timestamp);
-		if (std::llabs(timestamp_error) > 50000000LL)
-			reset_linked_audio_timeline(filter, audio, true);
-	}
-
-	const double stretch = 1.0 + ppm * 1.0e-6;
-	const double desired_frames = static_cast<double>(audio->frames) * stretch + filter->frame_remainder;
-	const uint32_t output_frames = static_cast<uint32_t>(std::max(1.0, std::floor(desired_frames)));
-	if (audio->frames > LinkedAudioClockFilter::kMaxInputFrames ||
-		output_frames > LinkedAudioClockFilter::kMaxOutputFrames) {
-		reset_linked_audio_timeline(filter, audio);
-		return audio;
-	}
-	filter->frame_remainder = desired_frames - static_cast<double>(output_frames);
-	filter->output = *audio;
-	filter->output.frames = output_frames;
-	filter->output.timestamp = filter->next_output_timestamp_ns
-		? filter->next_output_timestamp_ns : audio->timestamp;
-
-	if (output_frames == audio->frames) {
-		// No frame boundary is crossed in this block. Preserve the exact samples;
-		// the fractional command carries forward until one shared frame is added
-		// or removed from both stereo sources.
-		for (size_t channel = 0; channel < MAX_AV_PLANES; ++channel)
-			filter->output.data[channel] = audio->data[channel];
-	} else {
-		for (size_t channel = 0; channel < MAX_AV_PLANES; ++channel) {
-			if (!audio->data[channel]) {
-				filter->output.data[channel] = nullptr;
-				continue;
-			}
-			const float *input = reinterpret_cast<const float *>(audio->data[channel]);
-			auto &output = filter->planes[channel];
-			if (output_frames == 1 || audio->frames == 1) {
-				output[0] = input[0];
-			} else {
-				const double scale = static_cast<double>(audio->frames - 1) /
-					static_cast<double>(output_frames - 1);
-				for (uint32_t frame = 0; frame < output_frames; ++frame) {
-					const double position = static_cast<double>(frame) * scale;
-					const uint32_t left = static_cast<uint32_t>(position);
-					const uint32_t right = std::min(left + 1, audio->frames - 1);
-					const float fraction = static_cast<float>(position - static_cast<double>(left));
-					output[frame] = input[left] + (input[right] - input[left]) * fraction;
-				}
-			}
-			filter->output.data[channel] = reinterpret_cast<uint8_t *>(output.data());
-		}
-	}
-
-	if (audio->timestamp)
-		filter->expected_input_timestamp_ns = audio->timestamp +
-			audio_frames_to_ns(audio->frames, filter->sample_rate, filter->input_timestamp_remainder);
-	if (filter->output.timestamp)
-		filter->next_output_timestamp_ns = filter->output.timestamp +
-			audio_frames_to_ns(output_frames, filter->sample_rate, filter->output_timestamp_remainder);
-	filter->net_frame_adjustment += static_cast<int64_t>(output_frames) - static_cast<int64_t>(audio->frames);
-	if (filter->pair == 0)
-		core.report_audio_output(filter->output.timestamp, wall_ns,
-			filter->net_frame_adjustment, filter->sample_rate);
-	return &filter->output;
+	return audio;
 }
 
 obs_source_t *install_private_filter(obs_source_t *parent, const char *id,
@@ -1344,7 +1255,7 @@ public:
 			refresh_source_context();
 		});
 		connect(reconnect_receiver_, &QPushButton::clicked, this, [this] {
-			const bool ok = ReceiverRouter::instance().force_reconnect(false);
+			const bool ok = ReceiverRouter::instance().force_reconnect();
 			if (ok)
 				auto_reconnect_attempts_ = 0;
 			checklist_->setText(ok
@@ -1655,7 +1566,7 @@ private:
 		}
 		last_receiver_restart_ns_ = now_ns;
 		restart_ndi_->setEnabled(false);
-		const bool restarted = ReceiverRouter::instance().force_reconnect(false);
+		const bool restarted = ReceiverRouter::instance().force_reconnect();
 		if (restarted)
 			auto_reconnect_attempts_ = 0;
 		restart_ndi_->setEnabled(ReceiverRouter::instance().attached());
@@ -1821,7 +1732,7 @@ private:
 		// epoch. Rebuild the NDI receiver once after all settings are committed and
 		// discard the previous baseline instead of comparing a reset video clock
 		// against an older trusted relationship.
-		const bool receiver_restarted = ReceiverRouter::instance().force_reconnect(false);
+		const bool receiver_restarted = ReceiverRouter::instance().force_reconnect();
 		if (create_sources) {
 			const bool program_ok = add_proxy_to_current_scene(
 				kProgramSourceId, program_name_->text().toUtf8().constData(), true);
@@ -1967,9 +1878,9 @@ private:
 		if (sync.phase != mcb::DownstreamSyncPhase::Failed)
 			return;
 		++auto_reconnect_attempts_;
-		const bool reconnected = router.force_reconnect(true);
+		const bool reconnected = router.force_reconnect();
 		checklist_->setText(reconnected
-			? "Automatic recovery reconnected the existing receiver once. The trusted sync is being verified."
+			? "Automatic recovery restarted the receiver once and wiped the old timing epoch. A fresh baseline is being learned."
 			: "Automatic recovery could not reconnect this source. Output remains live unchanged; reconnect manually in Setup.");
 		if (isVisible())
 			update_status();

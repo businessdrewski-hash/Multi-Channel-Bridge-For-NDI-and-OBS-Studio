@@ -31,10 +31,10 @@ if "std::clamp(baseline_window_ms, 5000" not in cpp:
     raise SystemExit("Trusted baseline can mature in less than five stable seconds")
 for marker in (
     "observe_video(frame->timestamp, os_gettime_ns())",
-    "observe_audio_input(audio->timestamp, wall_ns)",
-    "Keep the receiver handoff untouched",
+    "observe_audio_input(audio->timestamp, now_ns)",
+    "Both stereo proxies receive one corrected packet duration and timestamp",
     "Video is the master clock. It passes through unchanged",
-    "reset_linked_audio_timeline(filter, audio, true)",
+    "reset_audio_correction_timeline(audio)",
 ):
     if marker not in bridge:
         raise SystemExit(f"Downstream correction marker is missing: {marker}")
