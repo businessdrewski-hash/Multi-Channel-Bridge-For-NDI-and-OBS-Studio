@@ -62,7 +62,7 @@ constexpr const char *kAudioClockFilterId = "ndi_multichannel_bridge_linked_audi
 constexpr const char *kVideoProbeFilterName = "[MCB] Downstream Video Clock";
 constexpr const char *kAudioClockFilterName = "[MCB] Linked Audio Clock";
 constexpr const char *kAudioClockPairKey = "mcb_audio_clock_pair";
-constexpr const char *kVersion = "0.6.0-alpha2";
+constexpr const char *kVersion = "0.6.0-alpha3";
 constexpr const char *kGovernorVersion = "2.0";
 constexpr const char *kSenderCoreVersion = "2.0";
 constexpr const char *kDefaultProgramName = "MCB Desktop / Game";
@@ -185,6 +185,7 @@ struct ProxyContext {
 obs_source_t *install_private_filter(obs_source_t *parent, const char *id,
 	const char *name, obs_data_t *settings = nullptr);
 void remove_private_filter(obs_source_t *parent, obs_source_t *&filter);
+size_t remove_private_filters_by_id(obs_source_t *parent, const char *id);
 
 class ReceiverRouter {
 public:
@@ -227,6 +228,47 @@ public:
 			}
 		}
 		remove_private_filter(source, filter);
+	}
+
+	void reconcile_audio_clock_filters()
+	{
+		std::array<obs_source_t *, 2> sources{};
+		std::array<obs_source_t *, 2> tracked{};
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			for (size_t pair = 0; pair < sources.size(); ++pair) {
+				if (proxies_[pair])
+					sources[pair] = obs_source_get_ref(proxies_[pair]);
+				tracked[pair] = audio_clock_filters_[pair];
+				audio_clock_filters_[pair] = nullptr;
+			}
+		}
+
+		for (size_t pair = 0; pair < sources.size(); ++pair) {
+			if (!sources[pair]) {
+				if (tracked[pair])
+					obs_source_release(tracked[pair]);
+				continue;
+			}
+			remove_private_filter(sources[pair], tracked[pair]);
+			obs_data_t *settings = obs_data_create();
+			obs_data_set_int(settings, kAudioClockPairKey, static_cast<long long>(pair));
+			obs_source_t *replacement = install_private_filter(sources[pair], kAudioClockFilterId,
+				kAudioClockFilterName, settings);
+			obs_data_release(settings);
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (proxies_[pair] == sources[pair]) {
+					audio_clock_filters_[pair] = replacement;
+					replacement = nullptr;
+				}
+			}
+			if (replacement)
+				remove_private_filter(sources[pair], replacement);
+			obs_source_release(sources[pair]);
+		}
+		obs_log(LOG_INFO,
+			"[multichannel-bridge] Reconciled linked audio clock filters after OBS source loading");
 	}
 
 	bool attach(const std::string &name)
@@ -750,17 +792,41 @@ obs_source_t *install_private_filter(obs_source_t *parent, const char *id,
 {
 	if (!parent || !id || !name)
 		return nullptr;
-	obs_source_t *existing = obs_source_get_filter_by_name(parent, name);
-	if (existing) {
-		const char *existing_id = obs_source_get_unversioned_id(existing);
-		if (existing_id && std::strcmp(existing_id, id) == 0)
-			obs_source_filter_remove(parent, existing);
-		obs_source_release(existing);
-	}
+	remove_private_filters_by_id(parent, id);
 	obs_source_t *filter = obs_source_create_private(id, name, settings);
 	if (filter)
 		obs_source_filter_add(parent, filter);
 	return filter;
+}
+
+struct PrivateFilterCollector {
+	const char *id = nullptr;
+	std::vector<obs_source_t *> matches;
+};
+
+void collect_private_filter(obs_source_t *, obs_source_t *child, void *param)
+{
+	auto *collector = static_cast<PrivateFilterCollector *>(param);
+	if (!collector || !child || !collector->id)
+		return;
+	const char *child_id = obs_source_get_unversioned_id(child);
+	if (!child_id)
+		child_id = obs_source_get_id(child);
+	if (child_id && std::strcmp(child_id, collector->id) == 0)
+		collector->matches.push_back(obs_source_get_ref(child));
+}
+
+size_t remove_private_filters_by_id(obs_source_t *parent, const char *id)
+{
+	if (!parent || !id)
+		return 0;
+	PrivateFilterCollector collector{id, {}};
+	obs_source_enum_filters(parent, collect_private_filter, &collector);
+	for (obs_source_t *filter : collector.matches) {
+		obs_source_filter_remove(parent, filter);
+		obs_source_release(filter);
+	}
+	return collector.matches.size();
 }
 
 void remove_private_filter(obs_source_t *parent, obs_source_t *&filter)
@@ -1339,8 +1405,9 @@ public:
 	{
 		set_role_cache(read_role_from_config());
 		refresh_sources();
-		if (mcb_is_receiver())
+		if (mcb_is_receiver()) {
 			apply_receiver(false);
+		}
 	}
 
 	void refresh_sources()
@@ -1679,6 +1746,10 @@ private:
 
 	void apply_receiver(bool create_sources)
 	{
+		// OBS restores serialized filters after each proxy source's create
+		// callback. Reconcile by filter type after loading or manual Apply so a
+		// saved copy and the callback-created copy cannot stack across restarts.
+		ReceiverRouter::instance().reconcile_audio_clock_filters();
 		const std::string source_name = receiver_source_->currentText().toUtf8().constData();
 		if (!ReceiverRouter::instance().attach(source_name)) {
 			checklist_->setText(QString("Receiver could not attach: %1")

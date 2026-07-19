@@ -1,6 +1,6 @@
 # Roadmap
 
-## Implemented through 0.6.0-alpha2
+## Implemented through 0.6.0-alpha3
 
 - Stable trusted-reference learning, sample quarantine, and median jitter filtering
 - High-confidence drift-rate estimation after at least 30 seconds of persistent evidence

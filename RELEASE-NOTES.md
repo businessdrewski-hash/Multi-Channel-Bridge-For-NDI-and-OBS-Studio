@@ -1,4 +1,11 @@
-# v0.6.0-alpha2 release notes
+# v0.6.0-alpha3 release notes
+
+## Alpha 3 filter lifecycle correction
+
+- Fixes linked audio clock filters accumulating on the two MCB proxy sources after each stream-PC OBS restart.
+- Reconciles filters after OBS finishes restoring the source collection, removing every matching filter by source type rather than only one exact display name.
+- Recreates exactly one correctly configured linked clock filter per MCB audio proxy.
+- Adds a release check preventing regression to name-only filter cleanup.
 
 ## Alpha 2 UI correction
 
@@ -123,8 +130,8 @@ OBS Track B -> NDI channels 3-4 -> Microphone
 The GitHub Action builds:
 
 ```text
-Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha2.exe
-Multichannel-Bridge-for-DistroAV-v0.6.0-alpha2-Portable-Windows-x64.zip
+Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha3.exe
+Multichannel-Bridge-for-DistroAV-v0.6.0-alpha3-Portable-Windows-x64.zip
 Multichannel-Bridge-DistroAV-6.2.1.patch
 SHA256SUMS.txt
 ```

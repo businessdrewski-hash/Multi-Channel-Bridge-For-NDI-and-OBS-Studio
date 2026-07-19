@@ -1,10 +1,10 @@
 # Install on both PCs
 
-Install the same `0.6.0-alpha2` package on the gaming PC and stream PC.
+Install the same `0.6.0-alpha3` package on the gaming PC and stream PC.
 
 ## Recommended EXE installation
 
-1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha2.exe`.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha3.exe`.
 2. Close OBS completely.
 3. Run setup as Administrator.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.

@@ -1,7 +1,7 @@
 # Multichannel Bridge for DistroAV
 
 > Experimental modified DistroAV build for two-PC OBS setups
-> Current version: **0.6.0-alpha2**
+> Current version: **0.6.0-alpha3**
 > Based on: **DistroAV 6.2.1**
 
 ## Personal project and support disclaimer
@@ -163,7 +163,7 @@ Compatibility outside that environment is not guaranteed.
 
 Install the same release on both computers.
 
-1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha2.exe`.
+1. Download `Multichannel-Bridge-for-DistroAV-Setup-v0.6.0-alpha3.exe`.
 2. Close OBS completely.
 3. Run the installer as Administrator on both PCs.
 4. Select the root OBS folder, normally `C:\Program Files\obs-studio`.
@@ -287,6 +287,10 @@ More detail: [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
 ---
 
 ## Consolidated changelog
+
+### 0.6.0-alpha3
+
+- Reconciles linked audio clock filters after OBS source restoration, deleting all type-matched duplicates and leaving exactly one filter on each MCB proxy after a restart.
 
 ### 0.6.0-alpha2
 

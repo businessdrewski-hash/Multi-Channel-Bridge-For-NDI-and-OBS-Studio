@@ -1,4 +1,4 @@
-# Validation notes for v0.6.0-alpha2
+# Validation notes for v0.6.0-alpha3
 
 Completed in the source-generation environment:
 

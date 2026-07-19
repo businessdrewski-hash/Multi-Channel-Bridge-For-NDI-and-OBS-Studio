@@ -23,10 +23,17 @@ required_bridge = (
     "core.observe_audio_input(audio->timestamp, wall_ns)",
     "core.report_audio_output",
     "reset_linked_audio_timeline(filter, audio, true)",
+    "void reconcile_audio_clock_filters()",
+    "remove_private_filters_by_id(parent, id);",
+    "obs_source_enum_filters(parent, collect_private_filter, &collector);",
+    "ReceiverRouter::instance().reconcile_audio_clock_filters();",
 )
 for marker in required_bridge:
     if marker not in bridge:
         raise SystemExit(f"Receiver safety marker is missing: {marker}")
+
+if "obs_source_get_filter_by_name(parent, name)" in bridge:
+    raise SystemExit("Clock-filter deduplication regressed to name-only lookup")
 
 required_patcher = (
     "mcb_force_reconnect_proc",
