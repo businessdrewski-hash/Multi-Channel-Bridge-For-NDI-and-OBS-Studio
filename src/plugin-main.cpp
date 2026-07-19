@@ -53,6 +53,12 @@ static bool plugin_features_registered = false;
 extern struct obs_source_info create_ndi_source_info();
 struct obs_source_info ndi_source_info;
 
+extern struct obs_source_info create_clocklab_video_probe_info();
+struct obs_source_info clocklab_video_probe_info;
+
+extern struct obs_source_info create_clocklab_audio_probe_info();
+struct obs_source_info clocklab_audio_probe_info;
+
 extern struct obs_output_info create_ndi_output_info();
 struct obs_output_info ndi_output_info;
 
@@ -259,6 +265,10 @@ static void register_plugin_features()
 	// The plugin features below require the NDI library. They must be registered only if the NDI library is successfully loaded and initialized.
 	ndi_source_info = create_ndi_source_info();
 	obs_register_source(&ndi_source_info);
+	clocklab_video_probe_info = create_clocklab_video_probe_info();
+	obs_register_source(&clocklab_video_probe_info);
+	clocklab_audio_probe_info = create_clocklab_audio_probe_info();
+	obs_register_source(&clocklab_audio_probe_info);
 
 	ndi_output_info = create_ndi_output_info();
 	obs_register_output(&ndi_output_info);

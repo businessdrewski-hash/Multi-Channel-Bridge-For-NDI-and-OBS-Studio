@@ -1,3 +1,8 @@
+> [!CAUTION]
+> This branch is the experimental **DistroAV Receiver Clock Lab 6.2.1.1**, not a production DistroAV release. It keeps
+> normal single-source NDI audio/video and adds an isolated receiver-clock experiment plus end-to-end diagnostics. Start
+> with [the lab overview](docs/receiver-clock-lab/README.md) and [test procedure](docs/receiver-clock-lab/REPRODUCTION.md).
+
 <div align="center">
 <h1>DistroAV</h1>
 <h3>Network Audio/Video in OBS-Studio using NDI technology</h3>  

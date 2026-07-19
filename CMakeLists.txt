@@ -85,7 +85,21 @@ target_sources(
     src/premultiplied-alpha-filter.cpp
     src/preview-output.cpp
     src/preview-output.h
+    src/receiver-clock-diagnostics.cpp
+    src/receiver-clock-diagnostics.h
 )
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(
+    receiver-clock-diagnostics-test
+    tests/receiver-clock-diagnostics-test.cpp
+    src/receiver-clock-diagnostics.cpp
+  )
+  target_include_directories(receiver-clock-diagnostics-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_features(receiver-clock-diagnostics-test PRIVATE cxx_std_17)
+  add_test(NAME receiver-clock-diagnostics COMMAND receiver-clock-diagnostics-test)
+endif()
 
 set(valid_uuid FALSE)
 check_uuid(${WINDOWS_APP_UUID} valid_uuid)

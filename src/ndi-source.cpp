@@ -17,6 +17,7 @@
 
 #include "plugin-main.h"
 #include "ndi-finder.h"
+#include "receiver-clock-diagnostics.h"
 
 #include <util/platform.h>
 #include <util/threading.h>
@@ -24,6 +25,8 @@
 #include <QDesktopServices>
 #include <QUrl>
 
+#include <algorithm>
+#include <fstream>
 #include <thread>
 
 #define PROP_SOURCE "ndi_source_name"
@@ -38,6 +41,9 @@
 #define PROP_YUV_COLORSPACE "yuv_colorspace"
 #define PROP_LATENCY "latency"
 #define PROP_AUDIO "ndi_audio"
+#define PROP_RECEIVER_CLOCK_MODE "ndi_receiver_clock_mode"
+#define PROP_CLOCK_DIAGNOSTICS "ndi_receiver_clock_diagnostics"
+#define PROP_CLOCK_DIAGNOSTICS_EXPORT "ndi_receiver_clock_diagnostics_export"
 #define PROP_PTZ "ndi_ptz"
 #define PROP_PAN "ndi_pan"
 #define PROP_TILT "ndi_tilt"
@@ -59,6 +65,14 @@
 #define PROP_SYNC_INTERNAL 0
 #define PROP_SYNC_NDI_TIMESTAMP 1
 #define PROP_SYNC_NDI_SOURCE_TIMECODE 2
+
+#define PROP_RECEIVER_CLOCK_STOCK_DIRECT 0
+#define PROP_RECEIVER_CLOCK_STOCK_FRAMESYNC 1
+#define PROP_RECEIVER_CLOCK_RECEIVER_PACED 2
+
+#define CLOCKLAB_VIDEO_PROBE_ID "distroav_receiver_clock_video_probe"
+#define CLOCKLAB_AUDIO_PROBE_ID "distroav_receiver_clock_audio_probe"
+#define CLOCKLAB_DIAGNOSTICS_POINTER "clocklab_diagnostics_pointer"
 
 #define PROP_YUV_RANGE_PARTIAL 1
 #define PROP_YUV_RANGE_FULL 2
@@ -100,6 +114,7 @@ typedef struct ndi_source_config_t {
 	int latency;
 	bool framesync_enabled;
 	bool hw_accel_enabled;
+	int receiver_clock_mode;
 
 	//
 	// Changes that do NOT require the NDI receiver to be reset:
@@ -110,6 +125,7 @@ typedef struct ndi_source_config_t {
 	video_range_type yuv_range;
 	video_colorspace yuv_colorspace;
 	bool audio_enabled;
+	bool clock_diagnostics_enabled;
 	ptz_t ptz;
 	NDIlib_tally_t tally;
 } ndi_source_config_t;
@@ -125,7 +141,125 @@ typedef struct ndi_source_t {
 	uint32_t height;
 
 	uint64_t last_frame_timestamp;
+
+	distroav::clocklab::Diagnostics *clock_diagnostics;
+	obs_source_t *clock_video_probe;
+	obs_source_t *clock_audio_probe;
 } ndi_source_t;
+
+typedef struct clocklab_probe_t {
+	distroav::clocklab::Diagnostics *diagnostics;
+} clocklab_probe_t;
+
+static obs_source_t *install_clocklab_probe(obs_source_t *parent, const char *id, const char *name,
+					    distroav::clocklab::Diagnostics *diagnostics)
+{
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_int(settings, CLOCKLAB_DIAGNOSTICS_POINTER,
+			 static_cast<long long>(reinterpret_cast<intptr_t>(diagnostics)));
+	obs_source_t *filter = obs_source_create_private(id, name, settings);
+	obs_data_release(settings);
+	if (filter)
+		obs_source_filter_add(parent, filter);
+	return filter;
+}
+
+static void remove_clocklab_probe(obs_source_t *parent, obs_source_t *filter)
+{
+	if (!filter)
+		return;
+	if (parent)
+		obs_source_filter_remove(parent, filter);
+	obs_source_release(filter);
+}
+
+static bool export_clocklab_diagnostics(ndi_source_t *source)
+{
+	if (!source || !source->clock_diagnostics)
+		return false;
+	char *directory = obs_module_config_path("");
+	if (directory) {
+		os_mkdirs(directory);
+		bfree(directory);
+	}
+	char *path = obs_module_config_path("receiver-clock-lab.csv");
+	if (!path)
+		return false;
+	std::ofstream output(path, std::ios::binary | std::ios::trunc);
+	if (output)
+		output << source->clock_diagnostics->csv();
+	const bool success = output.good();
+	output.close();
+	obs_log(success ? LOG_INFO : LOG_ERROR, "[receiver-clock-lab] Diagnostics export %s: %s",
+		success ? "written" : "failed", path);
+	bfree(path);
+	return success;
+}
+
+static const char *clocklab_video_probe_name(void *)
+{
+	return "DistroAV Receiver Clock Video Probe";
+}
+
+static const char *clocklab_audio_probe_name(void *)
+{
+	return "DistroAV Receiver Clock Audio Probe";
+}
+
+static void *clocklab_probe_create(obs_data_t *settings, obs_source_t *)
+{
+	auto *probe = new clocklab_probe_t();
+	probe->diagnostics = reinterpret_cast<distroav::clocklab::Diagnostics *>(
+		static_cast<intptr_t>(obs_data_get_int(settings, CLOCKLAB_DIAGNOSTICS_POINTER)));
+	return probe;
+}
+
+static void clocklab_probe_destroy(void *data)
+{
+	delete static_cast<clocklab_probe_t *>(data);
+}
+
+static obs_source_frame *clocklab_video_probe_filter(void *data, obs_source_frame *frame)
+{
+	auto *probe = static_cast<clocklab_probe_t *>(data);
+	if (probe && probe->diagnostics && frame && frame->timestamp)
+		probe->diagnostics->observe_selected_video(frame->timestamp, os_gettime_ns());
+	return frame;
+}
+
+static obs_audio_data *clocklab_audio_probe_filter(void *data, obs_audio_data *audio)
+{
+	auto *probe = static_cast<clocklab_probe_t *>(data);
+	if (probe && probe->diagnostics && audio && audio->timestamp)
+		probe->diagnostics->observe_filtered_audio(audio->timestamp, os_gettime_ns(), audio->frames);
+	return audio;
+}
+
+obs_source_info create_clocklab_video_probe_info()
+{
+	obs_source_info info = {};
+	info.id = CLOCKLAB_VIDEO_PROBE_ID;
+	info.type = OBS_SOURCE_TYPE_FILTER;
+	info.output_flags = OBS_SOURCE_ASYNC_VIDEO;
+	info.get_name = clocklab_video_probe_name;
+	info.create = clocklab_probe_create;
+	info.destroy = clocklab_probe_destroy;
+	info.filter_video = clocklab_video_probe_filter;
+	return info;
+}
+
+obs_source_info create_clocklab_audio_probe_info()
+{
+	obs_source_info info = {};
+	info.id = CLOCKLAB_AUDIO_PROBE_ID;
+	info.type = OBS_SOURCE_TYPE_FILTER;
+	info.output_flags = OBS_SOURCE_AUDIO;
+	info.get_name = clocklab_audio_probe_name;
+	info.create = clocklab_probe_create;
+	info.destroy = clocklab_probe_destroy;
+	info.filter_audio = clocklab_audio_probe_filter;
+	return info;
+}
 
 static obs_source_t *find_filter_by_id(obs_source_t *context, const char *id)
 {
@@ -280,7 +414,26 @@ obs_properties_t *ndi_source_getproperties(void *data)
 	obs_property_list_add_int(sync_modes, obs_module_text("NDIPlugin.SyncMode.NDISourceTimecode"),
 				  PROP_SYNC_NDI_SOURCE_TIMECODE);
 
-	obs_properties_add_bool(props, PROP_FRAMESYNC, obs_module_text("NDIPlugin.NDIFrameSync"));
+	obs_property_t *clock_modes = obs_properties_add_list(props, PROP_RECEIVER_CLOCK_MODE,
+							      obs_module_text("NDIPlugin.ReceiverClock.Mode"),
+							      OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(clock_modes, obs_module_text("NDIPlugin.ReceiverClock.Mode.StockDirect"),
+				  PROP_RECEIVER_CLOCK_STOCK_DIRECT);
+	obs_property_list_add_int(clock_modes, obs_module_text("NDIPlugin.ReceiverClock.Mode.StockFrameSync"),
+				  PROP_RECEIVER_CLOCK_STOCK_FRAMESYNC);
+	obs_property_list_add_int(clock_modes, obs_module_text("NDIPlugin.ReceiverClock.Mode.ReceiverPaced"),
+				  PROP_RECEIVER_CLOCK_RECEIVER_PACED);
+	obs_property_set_long_description(clock_modes, obs_module_text("NDIPlugin.ReceiverClock.Mode.Description"));
+
+	obs_property_t *diagnostics = obs_properties_add_bool(props, PROP_CLOCK_DIAGNOSTICS,
+							      obs_module_text("NDIPlugin.ReceiverClock.Diagnostics"));
+	obs_property_set_long_description(diagnostics,
+					  obs_module_text("NDIPlugin.ReceiverClock.Diagnostics.Description"));
+	obs_properties_add_button(props, PROP_CLOCK_DIAGNOSTICS_EXPORT,
+				  obs_module_text("NDIPlugin.ReceiverClock.Diagnostics.Export"),
+				  [](obs_properties_t *, obs_property_t *, void *private_data) {
+					  return export_clocklab_diagnostics(static_cast<ndi_source_t *>(private_data));
+				  });
 
 	obs_properties_add_bool(props, PROP_HW_ACCEL, obs_module_text("NDIPlugin.SourceProps.HWAccel"));
 
@@ -335,6 +488,9 @@ void ndi_source_getdefaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, PROP_BEHAVIOR, PROP_BEHAVIOR_STOP_RESUME_LAST_FRAME);
 	obs_data_set_default_int(settings, PROP_TIMEOUT, PROP_TIMEOUT_KEEP_CONTENT);
 	obs_data_set_default_int(settings, PROP_SYNC, PROP_SYNC_NDI_SOURCE_TIMECODE);
+	obs_data_set_default_int(settings, PROP_RECEIVER_CLOCK_MODE, PROP_RECEIVER_CLOCK_STOCK_DIRECT);
+	obs_data_set_default_bool(settings, PROP_FRAMESYNC, false);
+	obs_data_set_default_bool(settings, PROP_CLOCK_DIAGNOSTICS, false);
 	obs_data_set_default_int(settings, PROP_YUV_RANGE, PROP_YUV_RANGE_PARTIAL);
 	obs_data_set_default_int(settings, PROP_YUV_COLORSPACE, PROP_YUV_SPACE_BT709);
 	obs_data_set_default_int(settings, PROP_LATENCY, PROP_LATENCY_NORMAL);
@@ -375,11 +531,71 @@ void process_empty_frame(ndi_source_t *source)
 	}
 }
 
-void ndi_source_thread_process_audio3(ndi_source_config_t *config, NDIlib_audio_frame_v3_t *ndi_audio_frame,
-				      obs_source_t *obs_source, obs_source_audio *obs_audio_frame);
+void ndi_source_thread_process_audio3(ndi_source_t *source, NDIlib_audio_frame_v3_t *ndi_audio_frame,
+				      obs_source_audio *obs_audio_frame, uint64_t receiver_timestamp_ns = 0);
 
 void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v2_t *ndi_video_frame,
-				      obs_source *obs_source, obs_source_frame *obs_video_frame);
+				      obs_source_frame *obs_video_frame, uint64_t receiver_timestamp_ns = 0);
+
+struct receiver_clock_schedule_t {
+	uint32_t sample_rate = 48000;
+	uint32_t audio_block_frames = 1024;
+	uint64_t video_interval_ns = 16666667;
+	uint64_t receiver_epoch_ns = 0;
+	uint64_t next_audio_deadline_ns = 0;
+	uint64_t next_video_deadline_ns = 0;
+	uint64_t cumulative_audio_frames = 0;
+	uint64_t video_ticks = 0;
+	uint64_t audio_catchups = 0;
+	uint64_t video_catchups = 0;
+	uint64_t repeated_video_frames = 0;
+	uint64_t empty_audio_pulls = 0;
+	uint64_t empty_video_pulls = 0;
+	int64_t last_video_ndi_timestamp = 0;
+	uint64_t last_diagnostic_sample_ns = 0;
+
+	void reset(uint64_t now_ns)
+	{
+		obs_audio_info audio_info = {};
+		if (obs_get_audio_info(&audio_info) && audio_info.samples_per_sec)
+			sample_rate = audio_info.samples_per_sec;
+		obs_video_info video_info = {};
+		if (obs_get_video_info(&video_info) && video_info.fps_num && video_info.fps_den)
+			video_interval_ns = static_cast<uint64_t>(video_info.fps_den) * 1000000000ULL /
+					    static_cast<uint64_t>(video_info.fps_num);
+		receiver_epoch_ns = now_ns + 100000000ULL;
+		next_audio_deadline_ns = receiver_epoch_ns;
+		next_video_deadline_ns = receiver_epoch_ns;
+		cumulative_audio_frames = 0;
+		video_ticks = 0;
+		audio_catchups = 0;
+		video_catchups = 0;
+		repeated_video_frames = 0;
+		empty_audio_pulls = 0;
+		empty_video_pulls = 0;
+		last_video_ndi_timestamp = 0;
+		last_diagnostic_sample_ns = 0;
+	}
+
+	uint64_t audio_timestamp_ns() const
+	{
+		return receiver_epoch_ns + cumulative_audio_frames * 1000000000ULL / sample_rate;
+	}
+
+	uint64_t video_timestamp_ns() const { return receiver_epoch_ns + video_ticks * video_interval_ns; }
+
+	void advance_audio(uint32_t frames)
+	{
+		cumulative_audio_frames += frames;
+		next_audio_deadline_ns = audio_timestamp_ns();
+	}
+
+	void advance_video()
+	{
+		++video_ticks;
+		next_video_deadline_ns = video_timestamp_ns();
+	}
+};
 
 void *ndi_source_thread(void *data)
 {
@@ -407,6 +623,55 @@ void *ndi_source_thread(void *data)
 
 	int64_t timestamp_audio = 0;
 	int64_t timestamp_video = 0;
+	receiver_clock_schedule_t receiver_clock;
+
+	auto sample_diagnostics = [&](uint64_t now_ns) {
+		if (!s->clock_diagnostics || !s->clock_diagnostics->enabled())
+			return;
+		if (receiver_clock.last_diagnostic_sample_ns &&
+		    now_ns - receiver_clock.last_diagnostic_sample_ns < 250000000ULL)
+			return;
+		receiver_clock.last_diagnostic_sample_ns = now_ns;
+		distroav::clocklab::SchedulerSnapshot snapshot;
+		snapshot.mode = s->config.receiver_clock_mode;
+		snapshot.receiver_epoch_ns = receiver_clock.receiver_epoch_ns;
+		snapshot.next_audio_deadline_ns = receiver_clock.next_audio_deadline_ns;
+		snapshot.next_video_deadline_ns = receiver_clock.next_video_deadline_ns;
+		snapshot.cumulative_audio_frames = receiver_clock.cumulative_audio_frames;
+		snapshot.video_ticks = receiver_clock.video_ticks;
+		snapshot.audio_deadline_error_ns =
+			receiver_clock.next_audio_deadline_ns
+				? (now_ns >= receiver_clock.next_audio_deadline_ns
+					   ? static_cast<int64_t>(now_ns - receiver_clock.next_audio_deadline_ns)
+					   : -static_cast<int64_t>(receiver_clock.next_audio_deadline_ns - now_ns))
+				: 0;
+		snapshot.video_deadline_error_ns =
+			receiver_clock.next_video_deadline_ns
+				? (now_ns >= receiver_clock.next_video_deadline_ns
+					   ? static_cast<int64_t>(now_ns - receiver_clock.next_video_deadline_ns)
+					   : -static_cast<int64_t>(receiver_clock.next_video_deadline_ns - now_ns))
+				: 0;
+		snapshot.audio_catchups = receiver_clock.audio_catchups;
+		snapshot.video_catchups = receiver_clock.video_catchups;
+		snapshot.repeated_video_frames = receiver_clock.repeated_video_frames;
+		snapshot.empty_audio_pulls = receiver_clock.empty_audio_pulls;
+		snapshot.empty_video_pulls = receiver_clock.empty_video_pulls;
+		if (ndi_receiver) {
+			NDIlib_recv_performance_t total = {};
+			NDIlib_recv_performance_t dropped = {};
+			NDIlib_recv_queue_t queue = {};
+			ndiLib->recv_get_performance(ndi_receiver, &total, &dropped);
+			ndiLib->recv_get_queue(ndi_receiver, &queue);
+			snapshot.ndi_total_audio_frames = total.audio_frames;
+			snapshot.ndi_total_video_frames = total.video_frames;
+			snapshot.ndi_dropped_audio_frames = dropped.audio_frames;
+			snapshot.ndi_dropped_video_frames = dropped.video_frames;
+			snapshot.ndi_queued_audio_frames = queue.audio_frames;
+			snapshot.ndi_queued_video_frames = queue.video_frames;
+		}
+		s->clock_diagnostics->update_scheduler(snapshot);
+		s->clock_diagnostics->sample(now_ns);
+	};
 
 	//
 	// Main NDI receiver loop: BEGIN
@@ -417,6 +682,9 @@ void *ndi_source_thread(void *data)
 		//
 		if (s->config.reset_ndi_receiver) {
 			s->config.reset_ndi_receiver = false;
+			if (s->clock_diagnostics)
+				s->clock_diagnostics->mark_event(distroav::clocklab::Event::ReceiverReset,
+								 os_gettime_ns());
 
 			// If config.ndi_receiver_name changed, then so did obs_source_name
 			obs_source_name = obs_source_get_name(s->obs_source);
@@ -577,7 +845,12 @@ void *ndi_source_thread(void *data)
 						obs_source_name, recv_desc.source_to_connect_to.p_ndi_name);
 					break;
 				}
+				if (s->config.receiver_clock_mode == PROP_RECEIVER_CLOCK_RECEIVER_PACED)
+					receiver_clock.reset(os_gettime_ns());
 			}
+			if (s->clock_diagnostics)
+				s->clock_diagnostics->mark_event(distroav::clocklab::Event::ReceiverReady,
+								 os_gettime_ns());
 		}
 		//
 		// reset_ndi_receiver: END
@@ -654,43 +927,89 @@ void *ndi_source_thread(void *data)
 		}
 
 		if (ndi_frame_sync) {
-			//
-			// ndi_frame_sync
-			//
+			if (s->config.receiver_clock_mode == PROP_RECEIVER_CLOCK_RECEIVER_PACED) {
+				const uint64_t now_ns = os_gettime_ns();
+				if (now_ns >= receiver_clock.next_audio_deadline_ns) {
+					const uint64_t block_duration_ns =
+						static_cast<uint64_t>(receiver_clock.audio_block_frames) *
+						1000000000ULL / receiver_clock.sample_rate;
+					const uint64_t blocks_due =
+						1 + (now_ns - receiver_clock.next_audio_deadline_ns) /
+							    std::max<uint64_t>(1, block_duration_ns);
+					const uint32_t requested_frames = static_cast<uint32_t>(
+						std::min<uint64_t>(blocks_due, 4) * receiver_clock.audio_block_frames);
+					if (blocks_due > 1)
+						receiver_clock.audio_catchups += blocks_due - 1;
+					audio_frame = {};
+					ndiLib->framesync_capture_audio_v2(ndi_frame_sync, &audio_frame,
+									   receiver_clock.sample_rate, 0,
+									   requested_frames);
+					if (audio_frame.p_data && audio_frame.no_samples > 0) {
+						ndi_source_thread_process_audio3(s, &audio_frame, &obs_audio_frame,
+										 receiver_clock.audio_timestamp_ns());
+						receiver_clock.advance_audio(
+							static_cast<uint32_t>(audio_frame.no_samples));
+					} else {
+						++receiver_clock.empty_audio_pulls;
+						receiver_clock.advance_audio(requested_frames);
+					}
+					ndiLib->framesync_free_audio_v2(ndi_frame_sync, &audio_frame);
+				}
 
-			//
-			// AUDIO
-			//
-			audio_frame = {};
-			ndiLib->framesync_capture_audio_v2(
-				ndi_frame_sync, &audio_frame,
-				0,     // "The desired sample rate. 0 to get the source value."
-				0,     // "The desired channel count. 0 to get the source value."
-				1024); // "The desired sample count. 0 to get the source value."
-			// Note: "This function will always return data immediately, inserting silence if no current audio data is present."
-			if (audio_frame.p_data && (audio_frame.timestamp > timestamp_audio)) {
-				timestamp_audio = audio_frame.timestamp;
-				// obs_log(LOG_DEBUG, "%s: New Audio Frame (Framesync ON): ts=%d tc=%d", obs_source_name, audio_frame.timestamp, audio_frame.timecode);
-				ndi_source_thread_process_audio3(&s->config, &audio_frame, s->obs_source,
-								 &obs_audio_frame);
+				const uint64_t video_now_ns = os_gettime_ns();
+				if (video_now_ns >= receiver_clock.next_video_deadline_ns) {
+					const uint64_t missed = (video_now_ns - receiver_clock.next_video_deadline_ns) /
+								receiver_clock.video_interval_ns;
+					if (missed) {
+						receiver_clock.video_ticks += missed;
+						receiver_clock.video_catchups += missed;
+						receiver_clock.next_video_deadline_ns =
+							receiver_clock.video_timestamp_ns();
+					}
+					video_frame = {};
+					ndiLib->framesync_capture_video(ndi_frame_sync, &video_frame,
+									NDIlib_frame_format_type_progressive);
+					if (video_frame.p_data) {
+						if (receiver_clock.last_video_ndi_timestamp == video_frame.timestamp)
+							++receiver_clock.repeated_video_frames;
+						receiver_clock.last_video_ndi_timestamp = video_frame.timestamp;
+						ndi_source_thread_process_video2(s, &video_frame, &obs_video_frame,
+										 receiver_clock.video_timestamp_ns());
+					} else {
+						++receiver_clock.empty_video_pulls;
+					}
+					ndiLib->framesync_free_video(ndi_frame_sync, &video_frame);
+					receiver_clock.advance_video();
+				}
+
+				const uint64_t after_capture_ns = os_gettime_ns();
+				sample_diagnostics(after_capture_ns);
+				const uint64_t next_deadline = std::min(receiver_clock.next_audio_deadline_ns,
+									receiver_clock.next_video_deadline_ns);
+				if (next_deadline > after_capture_ns)
+					std::this_thread::sleep_for(
+						std::chrono::nanoseconds(next_deadline - after_capture_ns));
+			} else {
+				// Preserve DistroAV 6.2.1's existing FrameSync path as an unchanged reference mode.
+				audio_frame = {};
+				ndiLib->framesync_capture_audio_v2(ndi_frame_sync, &audio_frame, 0, 0, 1024);
+				if (audio_frame.p_data && (audio_frame.timestamp > timestamp_audio)) {
+					timestamp_audio = audio_frame.timestamp;
+					ndi_source_thread_process_audio3(s, &audio_frame, &obs_audio_frame);
+				}
+				ndiLib->framesync_free_audio_v2(ndi_frame_sync, &audio_frame);
+
+				video_frame = {};
+				ndiLib->framesync_capture_video(ndi_frame_sync, &video_frame,
+								NDIlib_frame_format_type_progressive);
+				if (video_frame.p_data && (video_frame.timestamp > timestamp_video)) {
+					timestamp_video = video_frame.timestamp;
+					ndi_source_thread_process_video2(s, &video_frame, &obs_video_frame);
+				}
+				ndiLib->framesync_free_video(ndi_frame_sync, &video_frame);
+				sample_diagnostics(os_gettime_ns());
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
 			}
-			ndiLib->framesync_free_audio_v2(ndi_frame_sync, &audio_frame);
-
-			//
-			// VIDEO
-			//
-			video_frame = {};
-			ndiLib->framesync_capture_video(ndi_frame_sync, &video_frame,
-							NDIlib_frame_format_type_progressive);
-			if (video_frame.p_data && (video_frame.timestamp > timestamp_video)) {
-				timestamp_video = video_frame.timestamp;
-				// obs_log(LOG_DEBUG, "%s: New Video Frame (Framesync ON): ts=%d tc=%d", obs_source_name, video_frame.timestamp, video_frame.timecode);
-				ndi_source_thread_process_video2(s, &video_frame, s->obs_source, &obs_video_frame);
-			}
-			ndiLib->framesync_free_video(ndi_frame_sync, &video_frame);
-
-			// TODO: More accurate sleep that subtracts the duration of this loop iteration?
-			std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		} else {
 			//
 			// !ndi_frame_sync
@@ -703,10 +1022,10 @@ void *ndi_source_thread(void *data)
 				// AUDIO
 				//
 				// obs_log(LOG_DEBUG, "%s: New Audio Frame (Framesync OFF): ts=%d tc=%d", obs_source_name, audio_frame.timestamp, audio_frame.timecode);
-				ndi_source_thread_process_audio3(&s->config, &audio_frame, s->obs_source,
-								 &obs_audio_frame);
+				ndi_source_thread_process_audio3(s, &audio_frame, &obs_audio_frame);
 
 				ndiLib->recv_free_audio_v3(ndi_receiver, &audio_frame);
+				sample_diagnostics(os_gettime_ns());
 				continue;
 			}
 
@@ -715,9 +1034,10 @@ void *ndi_source_thread(void *data)
 				// VIDEO
 				//
 				// obs_log(LOG_DEBUG, "%s: New Video Frame (Framesync OFF): ts=%d tc=%d", obs_source_name, video_frame.timestamp, video_frame.timecode);
-				ndi_source_thread_process_video2(s, &video_frame, s->obs_source, &obs_video_frame);
+				ndi_source_thread_process_video2(s, &video_frame, &obs_video_frame);
 
 				ndiLib->recv_free_video_v2(ndi_receiver, &video_frame);
+				sample_diagnostics(os_gettime_ns());
 				continue;
 			}
 
@@ -756,9 +1076,10 @@ void *ndi_source_thread(void *data)
 	return nullptr;
 }
 
-void ndi_source_thread_process_audio3(ndi_source_config_t *config, NDIlib_audio_frame_v3_t *ndi_audio_frame,
-				      obs_source_t *obs_source, obs_source_audio *obs_audio_frame)
+void ndi_source_thread_process_audio3(ndi_source_t *source, NDIlib_audio_frame_v3_t *ndi_audio_frame,
+				      obs_source_audio *obs_audio_frame, uint64_t receiver_timestamp_ns)
 {
+	auto config = &source->config;
 	if (!config->audio_enabled) {
 		return;
 	}
@@ -767,15 +1088,24 @@ void ndi_source_thread_process_audio3(ndi_source_config_t *config, NDIlib_audio_
 
 	obs_audio_frame->speakers = channel_count_to_layout(channelCount);
 
+	uint64_t source_timestamp_ns = 0;
 	switch (config->sync_mode) {
 	case PROP_SYNC_NDI_TIMESTAMP:
-		obs_audio_frame->timestamp = (uint64_t)(ndi_audio_frame->timestamp * 100);
+		source_timestamp_ns = (uint64_t)(ndi_audio_frame->timestamp * 100);
 		break;
 
 	case PROP_SYNC_NDI_SOURCE_TIMECODE:
-		obs_audio_frame->timestamp = (uint64_t)(ndi_audio_frame->timecode * 100);
+		source_timestamp_ns = (uint64_t)(ndi_audio_frame->timecode * 100);
 		break;
 	}
+	const uint64_t capture_wall_ns = os_gettime_ns();
+	if (source->clock_diagnostics)
+		source->clock_diagnostics->observe_capture_audio(ndi_audio_frame->timestamp, ndi_audio_frame->timecode,
+								 source_timestamp_ns, capture_wall_ns,
+								 static_cast<uint32_t>(ndi_audio_frame->no_samples),
+								 static_cast<uint32_t>(ndi_audio_frame->sample_rate),
+								 static_cast<uint32_t>(channelCount));
+	obs_audio_frame->timestamp = receiver_timestamp_ns ? receiver_timestamp_ns : source_timestamp_ns;
 
 	obs_audio_frame->samples_per_sec = ndi_audio_frame->sample_rate;
 	obs_audio_frame->format = AUDIO_FORMAT_FLOAT_PLANAR;
@@ -785,11 +1115,16 @@ void ndi_source_thread_process_audio3(ndi_source_config_t *config, NDIlib_audio_
 			(uint8_t *)ndi_audio_frame->p_data + (i * ndi_audio_frame->channel_stride_in_bytes);
 	}
 
-	obs_source_output_audio(obs_source, obs_audio_frame);
+	if (source->clock_diagnostics)
+		source->clock_diagnostics->observe_output_audio(obs_audio_frame->timestamp, os_gettime_ns(),
+								obs_audio_frame->frames,
+								obs_audio_frame->samples_per_sec,
+								static_cast<uint32_t>(channelCount));
+	obs_source_output_audio(source->obs_source, obs_audio_frame);
 }
 
 void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v2_t *ndi_video_frame,
-				      obs_source *obs_source, obs_source_frame *obs_video_frame)
+				      obs_source_frame *obs_video_frame, uint64_t receiver_timestamp_ns)
 {
 	switch (ndi_video_frame->FourCC) {
 	case NDIlib_FourCC_type_BGRA:
@@ -828,15 +1163,23 @@ void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v
 
 	auto config = &source->config;
 
+	uint64_t source_timestamp_ns = 0;
 	switch (config->sync_mode) {
 	case PROP_SYNC_NDI_TIMESTAMP:
-		obs_video_frame->timestamp = (uint64_t)(ndi_video_frame->timestamp * 100);
+		source_timestamp_ns = (uint64_t)(ndi_video_frame->timestamp * 100);
 		break;
 
 	case PROP_SYNC_NDI_SOURCE_TIMECODE:
-		obs_video_frame->timestamp = (uint64_t)(ndi_video_frame->timecode * 100);
+		source_timestamp_ns = (uint64_t)(ndi_video_frame->timecode * 100);
 		break;
 	}
+	const uint64_t capture_wall_ns = os_gettime_ns();
+	if (source->clock_diagnostics)
+		source->clock_diagnostics->observe_capture_video(ndi_video_frame->timestamp, ndi_video_frame->timecode,
+								 source_timestamp_ns, capture_wall_ns,
+								 static_cast<uint32_t>(ndi_video_frame->xres),
+								 static_cast<uint32_t>(ndi_video_frame->yres));
+	obs_video_frame->timestamp = receiver_timestamp_ns ? receiver_timestamp_ns : source_timestamp_ns;
 
 	source->width = ndi_video_frame->xres;
 	source->height = ndi_video_frame->yres;
@@ -847,7 +1190,10 @@ void ndi_source_thread_process_video2(ndi_source_t *source, NDIlib_video_frame_v
 	obs_video_frame->linesize[0] = ndi_video_frame->line_stride_in_bytes;
 	obs_video_frame->data[0] = ndi_video_frame->p_data;
 
-	obs_source_output_video(obs_source, obs_video_frame);
+	if (source->clock_diagnostics)
+		source->clock_diagnostics->observe_output_video(obs_video_frame->timestamp, os_gettime_ns(),
+								obs_video_frame->width, obs_video_frame->height);
+	obs_source_output_video(source->obs_source, obs_video_frame);
 }
 
 void ndi_source_thread_start(ndi_source_t *s)
@@ -934,13 +1280,28 @@ void ndi_source_update(void *data, obs_data_t *settings)
 		obs_source_name, new_latency, s->config.latency);
 	s->config.latency = new_latency;
 
-	auto new_framesync_enabled = obs_data_get_bool(settings, PROP_FRAMESYNC);
+	const int old_receiver_clock_mode = s->config.receiver_clock_mode;
+	const int new_receiver_clock_mode =
+		std::clamp(static_cast<int>(obs_data_get_int(settings, PROP_RECEIVER_CLOCK_MODE)),
+			   PROP_RECEIVER_CLOCK_STOCK_DIRECT, PROP_RECEIVER_CLOCK_RECEIVER_PACED);
+	reset_ndi_receiver |= (s->config.receiver_clock_mode != new_receiver_clock_mode);
+	s->config.receiver_clock_mode = new_receiver_clock_mode;
+	const bool new_framesync_enabled = new_receiver_clock_mode != PROP_RECEIVER_CLOCK_STOCK_DIRECT;
+	obs_data_set_bool(settings, PROP_FRAMESYNC, new_framesync_enabled);
 	reset_ndi_receiver |= (s->config.framesync_enabled != new_framesync_enabled);
 	obs_log(LOG_DEBUG,
 		"'%s' ndi_source_update: Check for 'Framesync' setting changes: new_framesync_enabled='%s' vs config.framesync_enabled='%s'",
 		obs_source_name, new_framesync_enabled ? "true" : "false",
 		s->config.framesync_enabled ? "true" : "false");
 	s->config.framesync_enabled = new_framesync_enabled;
+
+	const bool diagnostics_enabled = obs_data_get_bool(settings, PROP_CLOCK_DIAGNOSTICS);
+	if (s->clock_diagnostics) {
+		s->clock_diagnostics->set_enabled(diagnostics_enabled, os_gettime_ns());
+		if (old_receiver_clock_mode != new_receiver_clock_mode)
+			s->clock_diagnostics->mark_event(distroav::clocklab::Event::ModeChanged, os_gettime_ns());
+	}
+	s->config.clock_diagnostics_enabled = diagnostics_enabled;
 
 	auto new_hw_accel_enabled = obs_data_get_bool(settings, PROP_HW_ACCEL);
 	reset_ndi_receiver |= (s->config.hw_accel_enabled != new_hw_accel_enabled);
@@ -1105,9 +1466,10 @@ void ndi_source_update(void *data, obs_data_t *settings)
 	}
 	// Provide all the source config when updated
 	obs_log(LOG_INFO,
-		"NDI Source Updated: '%s', 'Bandwidth'='%d', Latency='%d', Framesync='%s', HardwareAcceleration='%s', behavior='%d', timeoutmode='%d', sync_mode='%d', yuv_range='%d', yuv_colorspace='%d'",
+		"NDI Source Updated: '%s', 'Bandwidth'='%d', Latency='%d', Framesync='%s', ReceiverClockMode='%d', ClockDiagnostics='%s', HardwareAcceleration='%s', behavior='%d', timeoutmode='%d', sync_mode='%d', yuv_range='%d', yuv_colorspace='%d'",
 		s->config.ndi_source_name, s->config.bandwidth, s->config.latency,
-		s->config.framesync_enabled ? "enabled" : "disabled",
+		s->config.framesync_enabled ? "enabled" : "disabled", s->config.receiver_clock_mode,
+		s->config.clock_diagnostics_enabled ? "enabled" : "disabled",
 		s->config.hw_accel_enabled ? "enabled" : "disabled", s->config.behavior, s->config.timeout_action,
 		s->config.sync_mode, s->config.yuv_range, s->config.yuv_colorspace);
 
@@ -1192,12 +1554,31 @@ void *ndi_source_create(obs_data_t *settings, obs_source_t *obs_source)
 
 	auto s = (ndi_source_t *)bzalloc(sizeof(ndi_source_t));
 	s->obs_source = obs_source;
+	s->clock_diagnostics = new distroav::clocklab::Diagnostics();
+	char *clocklab_directory = obs_module_config_path("");
+	if (clocklab_directory) {
+		os_mkdirs(clocklab_directory);
+		bfree(clocklab_directory);
+	}
+	const char *source_uuid = obs_source_get_uuid(obs_source);
+	const std::string clocklab_filename =
+		std::string("receiver-clock-lab-") + (source_uuid && *source_uuid ? source_uuid : "source") + ".csv";
+	char *clocklab_path = obs_module_config_path(clocklab_filename.c_str());
+	if (clocklab_path) {
+		s->clock_diagnostics->set_live_output_path(clocklab_path);
+		obs_log(LOG_INFO, "[receiver-clock-lab] Live diagnostics path: %s", clocklab_path);
+		bfree(clocklab_path);
+	}
 	new_ndi_receiver_name(obs_source_name, &(s->config.ndi_receiver_name));
 
 	auto sh = obs_source_get_signal_handler(s->obs_source);
 	signal_handler_connect(sh, "rename", on_ndi_source_renamed, s);
 
 	ndi_source_update(s, settings);
+	s->clock_video_probe = install_clocklab_probe(obs_source, CLOCKLAB_VIDEO_PROBE_ID,
+						      "DistroAV Receiver Clock Video Probe", s->clock_diagnostics);
+	s->clock_audio_probe = install_clocklab_probe(obs_source, CLOCKLAB_AUDIO_PROBE_ID,
+						      "DistroAV Receiver Clock Audio Probe", s->clock_diagnostics);
 
 	obs_log(LOG_DEBUG, "'%s' -ndi_source_create(…)", obs_source_name);
 
@@ -1214,6 +1595,12 @@ void ndi_source_destroy(void *data)
 	signal_handler_disconnect(sh, "rename", on_ndi_source_renamed, s);
 
 	ndi_source_thread_stop(s);
+	remove_clocklab_probe(s->obs_source, s->clock_video_probe);
+	remove_clocklab_probe(s->obs_source, s->clock_audio_probe);
+	s->clock_video_probe = nullptr;
+	s->clock_audio_probe = nullptr;
+	delete s->clock_diagnostics;
+	s->clock_diagnostics = nullptr;
 
 	if (s->config.ndi_receiver_name) {
 		bfree(s->config.ndi_receiver_name);

@@ -37,8 +37,8 @@
         }
     },
     "name": "distroav",
-    "displayName": "DistroAV",
-    "version": "6.2.1",
+    "displayName": "DistroAV Receiver Clock Lab",
+    "version": "6.2.1.1",
     "website": "https://distroav.org",
     "author": "DistroAV",
     "email": "contact@distroav.org",
